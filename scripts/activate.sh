@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Activate mapper development environment in a temporary subshell
+#
+# Usage:
+#   ./scripts/activate
+#
+# Exit the subshell to deactivate.
+
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CONFIG_FILE="$SCRIPT_DIR/config.sh"
+VENV_ACT="$PROJECT_ROOT/.venv/bin/activate"
+
+# -------------------------
+# Preflight checks (parent)
+# -------------------------
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo -e "${RED}ERROR: missing scripts/config.sh${NC}"
+  exit 1
+fi
+
+# shellcheck disable=SC1091
+source "$CONFIG_FILE"
+
+if [[ -z "${LLVM_VERSION:-}" ]]; then
+  echo -e "${RED}ERROR: LLVM_VERSION not set in scripts/config.sh${NC}"
+  exit 1
+fi
+
+if [[ ! -f "$VENV_ACT" ]]; then
+  echo -e "${RED}ERROR: Python virtual environment not found:${NC}"
+  echo "  $PROJECT_ROOT/.venv"
+  echo "Run: scripts/install.sh"
+  exit 1
+fi
+
+if ! command -v "clang-$LLVM_VERSION" >/dev/null 2>&1; then
+  echo -e "${RED}ERROR: clang-$LLVM_VERSION not found on PATH${NC}"
+  echo "Run: scripts/install.sh"
+  exit 1
+fi
+
+echo -e "${GREEN}▶ Launching mapper environment${NC}"
+echo ""
+
+# -------------------------
+# Subshell (setup quietly, then drop interactive)
+# -------------------------
+exec bash --noprofile --norc -c "
+  set -e
+
+  export LLVM_VERSION='${LLVM_VERSION}'
+  export MAPPER_DEV_SHELL=1
+
+  cd '${PROJECT_ROOT}'
+
+  # Activate venv (modifies PATH, sets VIRTUAL_ENV, etc.)
+  source '${VENV_ACT}'
+
+  # Deterministic LLVM aliases (aliases won't persist into a *new* bash unless we define them again)
+  # We'll define them again in the interactive shell via BASH_ENV below.
+  export MAPPER_LLVM_ALIASES=\"
+alias clang='clang-${LLVM_VERSION}'
+alias clang++='clang++-${LLVM_VERSION}'
+alias opt='opt-${LLVM_VERSION}'
+alias llvm-dis='llvm-dis-${LLVM_VERSION}'
+alias llvm-as='llvm-as-${LLVM_VERSION}'
+alias llc='llc-${LLVM_VERSION}'
+\"
+
+  # Print clean, continuous proof (no prompts)
+  echo -e '${GREEN}✓ Python:${NC} '\"\$(python --version)\"
+  echo -e '${GREEN}✓ Python path:${NC} '\"\$(which python)\"
+  echo -e '${GREEN}✓ VENV:${NC} '\"\${VIRTUAL_ENV:-<not set>}\"
+  echo -e '${GREEN}✓ LLVM:${NC} '\"\$(clang-${LLVM_VERSION} --version | head -n 1)\"
+  echo -e '${GREEN}✓ clang path:${NC} '\"\$(which clang-${LLVM_VERSION})\"
+
+  python - <<'PYEOF'
+import mapper
+print('✓ mapper import OK:', mapper.__file__)
+PYEOF
+
+  echo ''
+  echo '=========================================='
+  echo ' mapper environment ready'
+  echo '=========================================='
+  echo ' LLVM_VERSION='\"\$LLVM_VERSION\"
+  echo ' VIRTUAL_ENV='\"\${VIRTUAL_ENV:-<not set>}\"
+  echo ' Deactivate with: exit'
+  echo ''
+
+  # Create a tiny rc file for the interactive shell so aliases + prompt are guaranteed
+  TMP_RC=\$(mktemp)
+  cat > \"\$TMP_RC\" <<'RC_EOF'
+# mapper dev shell rc
+if [[ -n \"\${MAPPER_DEV_SHELL:-}\" ]]; then
+  # Ensure prompt is obvious and not overridden by user rc
+  export PS1='(mapper) \u@\h:\w\$ '
+  # Install deterministic LLVM aliases
+  eval \"\$MAPPER_LLVM_ALIASES\"
+fi
+RC_EOF
+
+  # Start interactive shell WITHOUT user rc files (so prompt/aliases stay)
+  exec bash --noprofile --norc --rcfile \"\$TMP_RC\" -i
+"
