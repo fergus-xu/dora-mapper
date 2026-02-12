@@ -6,12 +6,16 @@
 #
 # Exit the subshell to deactivate.
 
-set -e
-
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    echo "ERROR: Do not source this script."
+    echo "Run it instead:"
+    echo "  ./scripts/activate"
+    return 0
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
