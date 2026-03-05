@@ -140,6 +140,21 @@ fi
 echo -e "${GREEN}✓ mapper installed successfully${NC}"
 echo ""
 
+# Build LLVM passes
+echo -e "${YELLOW}Building LLVM passes...${NC}"
+if command -v cmake &> /dev/null; then
+    if make passes; then
+        echo -e "${GREEN}✓ LLVM passes built successfully${NC}"
+    else
+        echo -e "${YELLOW}Warning: Failed to build LLVM passes${NC}"
+        echo "You can build them later with: make passes"
+    fi
+else
+    echo -e "${YELLOW}Warning: cmake not found, skipping LLVM pass build${NC}"
+    echo "Install cmake and run 'make passes' to build LLVM passes"
+fi
+echo ""
+
 # Verify installation
 echo -e "${YELLOW}Verifying installation...${NC}"
 if python -c "import mapper; print('mapper import OK:', mapper.__file__)" 2>/dev/null; then
@@ -163,6 +178,7 @@ fi
 echo -e "${GREEN}✓ LLVM $LLVM_VERSION tools accessible (at least clang-$LLVM_VERSION)${NC}"
 echo ""
 
+echo ""
 echo "=========================================="
 echo "Installation Complete!"
 echo "=========================================="
@@ -174,6 +190,8 @@ echo "LLVM notes:"
 echo "  - Installed via apt.llvm.org into this Ubuntu/WSL distro"
 echo "  - Use versioned binaries for determinism:"
 echo -e "    ${GREEN}clang-$LLVM_VERSION${NC}  (and opt-$LLVM_VERSION, llvm-dis-$LLVM_VERSION, etc.)"
+echo "  - LLVM passes built in llvm/llvm_passes.so"
+echo "  - Run 'make passes' to rebuild if needed"
 echo ""
 if [ $DEV_MODE -eq 1 ]; then
     echo "Development tools installed:"

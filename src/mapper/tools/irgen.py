@@ -12,9 +12,11 @@ from typing import Iterable, Sequence
 class IRGenResult:
     input_c: Path
     output_ll: Path
+    output_dfg: Path | None
     llvm_version: str
     clang: str
     cmd: tuple[str, ...]
+    dfg_cmd: tuple[str, ...] | None
 
 
 class IRGenError(RuntimeError):
@@ -46,6 +48,7 @@ def c_to_llvm_ir(
     c_file: str | Path,
     *,
     out_ll: str | Path | None = None,
+    run_passes: bool = True,
     include_dirs: Iterable[str | Path] = (),
     defines: Iterable[str] = (),
     std: str = "c11",
@@ -54,6 +57,7 @@ def c_to_llvm_ir(
 ) -> IRGenResult:
     """
     Compile a single C file to textual LLVM IR (.ll) using clang-$LLVM_VERSION.
+    Optionally run LLVM passes to extract DFG.
 
     Requires env var LLVM_VERSION to be set (your dev shell does this).
     """
@@ -68,7 +72,12 @@ def c_to_llvm_ir(
     if out_ll is None:
         ll_path = c_path.with_suffix(".ll")
     else:
-        ll_path = Path(out_ll).expanduser().resolve()
+        ll_path = Path(out_ll).expanduser()
+        # If out_ll is just a filename (no directory), put it in the same dir as the C file
+        if not ll_path.is_absolute() and len(ll_path.parts) == 1:
+            ll_path = c_path.parent / ll_path
+        else:
+            ll_path = ll_path.resolve()
         if ll_path.is_dir():
             ll_path = ll_path / (c_path.stem + ".ll")
 
@@ -95,10 +104,49 @@ def c_to_llvm_ir(
 
     _run(cmd)
 
+    # Run LLVM passes if requested
+    dfg_path = None
+    dfg_cmd = None
+    if run_passes:
+        opt = f"opt-{llvm_version}"
+        
+        # Find the pass plugin (look in repository root)
+        repo_root = Path(__file__).parent.parent.parent.parent
+        pass_plugin = repo_root / "llvm" / "llvm_passes.so"
+        
+        if pass_plugin.exists():
+            # First lower GEPs, then extract DFG
+            dfg_cmd_list = [
+                opt,
+                f"-load-pass-plugin={pass_plugin}",
+                "-passes=lower-gep,extract-dfg",
+                "-disable-output",
+                str(ll_path),
+            ]
+            
+            # Run from the directory of the .ll file so JSON is created there
+            original_dir = Path.cwd()
+            try:
+                os.chdir(ll_path.parent)
+                _run(dfg_cmd_list)
+                
+                # Look for generated JSON file
+                # The pass creates <function_name>_dfg.json
+                json_files = sorted(Path(".").glob("*_dfg.json"))
+                if json_files:
+                    # Use the most recently modified one
+                    dfg_path = ll_path.parent / json_files[-1].name
+            finally:
+                os.chdir(original_dir)
+            
+            dfg_cmd = tuple(dfg_cmd_list)
+
     return IRGenResult(
         input_c=c_path,
         output_ll=ll_path,
+        output_dfg=dfg_path,
         llvm_version=llvm_version,
         clang=clang,
         cmd=tuple(cmd),
+        dfg_cmd=dfg_cmd,
     )

@@ -1,0 +1,303 @@
+{
+  "function": "spmv_csr",
+  "nodes": [
+    {
+      "bitwidth": 32,
+      "fu": "input",
+      "id": "0",
+      "opcode": "input",
+      "pred": [],
+      "succ": [
+        "8"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "input",
+      "id": "1",
+      "opcode": "input",
+      "pred": [],
+      "succ": [
+        "7",
+        "10"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "const",
+      "id": "2",
+      "opcode": "const",
+      "pred": [],
+      "succ": [
+        "7",
+        "10",
+        "13"
+      ],
+      "value": 4
+    },
+    {
+      "bitwidth": 32,
+      "fu": "input",
+      "id": "3",
+      "opcode": "input",
+      "pred": [],
+      "succ": [
+        "11"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "input",
+      "id": "4",
+      "opcode": "input",
+      "pred": [],
+      "succ": [
+        "14"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "input",
+      "id": "5",
+      "opcode": "input",
+      "pred": [],
+      "succ": [
+        "16"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "input",
+      "id": "6",
+      "opcode": "input",
+      "pred": [],
+      "succ": [
+        "16"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "alu",
+      "id": "7",
+      "opcode": "mul",
+      "pred": [
+        "1",
+        "2"
+      ],
+      "succ": [
+        "8"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "alu",
+      "id": "8",
+      "opcode": "add",
+      "pred": [
+        "0",
+        "7"
+      ],
+      "succ": [
+        "9"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "mem",
+      "id": "9",
+      "opcode": "load",
+      "pred": [
+        "8"
+      ],
+      "succ": [
+        "13"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "alu",
+      "id": "10",
+      "opcode": "mul",
+      "pred": [
+        "1",
+        "2"
+      ],
+      "succ": [
+        "11"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "alu",
+      "id": "11",
+      "opcode": "add",
+      "pred": [
+        "3",
+        "10"
+      ],
+      "succ": [
+        "12"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "mem",
+      "id": "12",
+      "opcode": "load",
+      "pred": [
+        "11"
+      ],
+      "succ": [
+        "16"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "alu",
+      "id": "13",
+      "opcode": "mul",
+      "pred": [
+        "9",
+        "2"
+      ],
+      "succ": [
+        "14"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "alu",
+      "id": "14",
+      "opcode": "add",
+      "pred": [
+        "4",
+        "13"
+      ],
+      "succ": [
+        "15"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "mem",
+      "id": "15",
+      "opcode": "load",
+      "pred": [
+        "14"
+      ],
+      "succ": [
+        "16"
+      ]
+    },
+    {
+      "bitwidth": 32,
+      "fu": "fpu",
+      "id": "16",
+      "opcode": "fma",
+      "pred": [
+        "12",
+        "15",
+        "5",
+        "6"
+      ],
+      "succ": []
+    }
+  ],
+  "edges": [
+    {
+      "bitwidth": 32,
+      "dest": "7",
+      "source": "1"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "7",
+      "source": "2"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "8",
+      "source": "0"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "8",
+      "source": "7"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "9",
+      "source": "8"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "10",
+      "source": "1"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "10",
+      "source": "2"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "11",
+      "source": "3"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "11",
+      "source": "10"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "12",
+      "source": "11"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "13",
+      "source": "9"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "13",
+      "source": "2"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "14",
+      "source": "4"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "14",
+      "source": "13"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "15",
+      "source": "14"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "16",
+      "source": "12"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "16",
+      "source": "15"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "16",
+      "source": "5"
+    },
+    {
+      "bitwidth": 32,
+      "dest": "16",
+      "source": "6"
+    }
+  ]
+}

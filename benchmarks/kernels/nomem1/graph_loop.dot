@@ -1,0 +1,32 @@
+digraph G {
+    const0 [opcode=const, bitwidth=32, constVal="0"];
+    i0_phi [opcode=phi, bitwidth=32];
+    i1_phi [opcode=phi, bitwidth=32];
+    const1 [opcode=const, bitwidth=32, constVal="3"];
+    i3_mul [opcode=mul, bitwidth=32];
+    i4_add [opcode=add, bitwidth=32];
+    const2 [opcode=const, bitwidth=32, constVal="1"];
+    i5_add [opcode=add, bitwidth=32];
+    input0 [opcode=input, bitwidth=32];
+    i6_icmp [opcode=icmp, bitwidth=32];
+    bb0 [opcode=input, bitwidth=32];
+    ".loopexit" [opcode=input, bitwidth=32];
+    i7_br [opcode=br, bitwidth=32];
+    i4_output [opcode=output, bitwidth=32];
+    const0 -> i0_phi [operand=RHS, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=true];
+    const0 -> i1_phi [operand=RHS, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=true];
+    i0_phi -> i3_mul [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    i0_phi -> i5_add [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    i1_phi -> i4_add [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    const1 -> i3_mul [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    i3_mul -> i4_add [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    i4_add -> i1_phi [operand=LHS, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    i4_add -> i4_output [bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    const2 -> i5_add [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    i5_add -> i0_phi [operand=LHS, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    i5_add -> i6_icmp [operand=LHS, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    input0 -> i6_icmp [operand=RHS, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    i6_icmp -> i7_br [operand=branch_cond, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    bb0 -> i7_br [operand=branch_true, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    ".loopexit" -> i7_br [operand=branch_false, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+}
