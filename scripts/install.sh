@@ -71,6 +71,8 @@ if ! command -v uv &> /dev/null; then
     echo -e "${YELLOW}uv not found, installing...${NC}"
     curl -LsSf https://astral.sh/uv/install.sh | sh
 
+    export PATH="$HOME/.local/bin:$PATH"
+
     # Source the cargo env to make uv available in current shell
     if [ -f "$HOME/.cargo/env" ]; then
         source "$HOME/.cargo/env"
