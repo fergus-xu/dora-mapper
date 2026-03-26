@@ -111,7 +111,7 @@ def cmd_map(args: argparse.Namespace) -> int:
             op_latencies[op_enum] = 1
 
     # NETWORK LATENCIES
-    # Calculate routing latencies based on Manhattan distances between compatible FUs.
+    # Calculate routing latencies using topological shortest paths on the MRRG.
     network_latencies = {}
     for src in OperationType:
         if src == OperationType.OUTPUT:
@@ -129,21 +129,30 @@ def cmd_map(args: argparse.Namespace) -> int:
                 network_latencies[OperationLatencyEdge(src, sink)] = (1, 2)
                 continue
                 
-            # Calculate physical coordinate distances (Manhattan)
-            distances = []
+            # Calculate cycle routing latency using MRRG shortest paths
+            path_latencies = []
             for s_fu in src_fus:
                 for d_fu in sink_fus:
-                    if s_fu.coordinates and d_fu.coordinates:
-                        dist = abs(s_fu.coordinates[0] - d_fu.coordinates[0]) + \
-                               abs(s_fu.coordinates[1] - d_fu.coordinates[1])
-                        distances.append(dist)
+                    # k=1 gives the absolute shortest path between this specific src/sink pair
+                    paths = mrrg.get_k_shortest_paths_between_fu_nodes_optimized(s_fu.id, d_fu.id, k=1)
+                    if paths and len(paths[0]) > 0:
+                        shortest_path = paths[0]
+                        # Combinational wire latency=0, register latency=1.
+                        # Sum the true pipeline stage latency of the intermediate path.
+                        latency = sum(
+                            mrrg.get_node(node_id).latency 
+                            for node_id in shortest_path[1:-1] 
+                            if mrrg.get_node(node_id)
+                        )
+                        path_latencies.append(latency)
             
-            if distances:
-                # Minimum of 1 cycle, scale with distance
-                min_dist = max(1, min(distances))
-                max_dist = max(2, max(distances) + 1)
-                network_latencies[OperationLatencyEdge(src, sink)] = (min_dist, max_dist)
+            if path_latencies:
+                # Bound between the fastest path we found and the slowest "fastest" path + 1
+                min_lat = max(1, min(path_latencies))
+                max_lat = max(2, max(path_latencies) + 1)
+                network_latencies[OperationLatencyEdge(src, sink)] = (min_lat, max_lat)
             else:
+                # Fall back on (1, 2) if no paths found
                 network_latencies[OperationLatencyEdge(src, sink)] = (1, 2)
     
     latency_spec = LatencySpecification(
