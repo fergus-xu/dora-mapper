@@ -81,18 +81,69 @@ def cmd_map(args: argparse.Namespace) -> int:
     from mapper.graph.dfg import OperationType
     from mapper.schedules.latency_spec import OperationLatencyEdge
     
-    # Default operation latencies (1 cycle for most ops)
-    op_latencies = {op_type: 1 for op_type in OperationType}
-    # FP operations might be slower
-    op_latencies[OperationType.FMUL] = 2
-    op_latencies[OperationType.FDIV] = 4
-    op_latencies[OperationType.SQRT] = 4
-    
-    # Default network latencies (1 cycle min, 2 cycle max)
+    # OPERATION LATENCIES
+    # Infer from MRRG FUs to handle heterogeneous FUs.
+    op_latencies = {}
+    for fu in mrrg.get_fu_nodes():
+        for op in fu.supported_operations:
+            # Take the optimistic minimum latency for ASAP scheduling.
+            if op not in op_latencies:
+                op_latencies[op] = fu.latency
+            else:
+                op_latencies[op] = min(op_latencies[op], fu.latency)
+                
+    # Fallback to compiler_arch if provided and MRRG lacked latency specs
+    if compiler_arch_path:
+        with open(compiler_arch_path, 'r') as f:
+            compiler_arch = json.load(f)
+        for cap in compiler_arch.get("module_operation_capabilities", []):
+            module_latency = cap.get("latency", 0)
+            for op_str in cap.get("operations", []):
+                for op_enum in OperationType:
+                    if op_enum.name == op_str.upper() or op_enum.value.lower() == op_str.lower():
+                        if op_enum not in op_latencies:
+                            op_latencies[op_enum] = module_latency
+                        break
+
+    # Final fallback for missing operations to prevent crashes
+    for op_enum in OperationType:
+        if op_enum not in op_latencies:
+            op_latencies[op_enum] = 1
+
+    # NETWORK LATENCIES
+    # Calculate routing latencies based on Manhattan distances between compatible FUs.
     network_latencies = {}
     for src in OperationType:
+        if src == OperationType.OUTPUT:
+            continue
+        src_fus = mrrg.get_compatible_fus(src)
+
         for sink in OperationType:
-            if src != OperationType.OUTPUT and sink != OperationType.INPUT:
+            if sink == OperationType.INPUT:
+                continue
+                
+            sink_fus = mrrg.get_compatible_fus(sink)
+            
+            # If we don't have compatible FUs for either, fallback to default (1, 2)
+            if not src_fus or not sink_fus:
+                network_latencies[OperationLatencyEdge(src, sink)] = (1, 2)
+                continue
+                
+            # Calculate physical coordinate distances (Manhattan)
+            distances = []
+            for s_fu in src_fus:
+                for d_fu in sink_fus:
+                    if s_fu.coordinates and d_fu.coordinates:
+                        dist = abs(s_fu.coordinates[0] - d_fu.coordinates[0]) + \
+                               abs(s_fu.coordinates[1] - d_fu.coordinates[1])
+                        distances.append(dist)
+            
+            if distances:
+                # Minimum of 1 cycle, scale with distance
+                min_dist = max(1, min(distances))
+                max_dist = max(2, max(distances) + 1)
+                network_latencies[OperationLatencyEdge(src, sink)] = (min_dist, max_dist)
+            else:
                 network_latencies[OperationLatencyEdge(src, sink)] = (1, 2)
     
     latency_spec = LatencySpecification(
