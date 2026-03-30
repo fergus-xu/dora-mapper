@@ -93,96 +93,162 @@ class HeuristicMapper:
         self._final_cost = 0.0
         self._timed_out = False
 
-    def map(self) -> Dict[str, Any]:
-        """
-        Run the heuristic mapping flow.
+    def _calculate_min_ii(self) -> int:
+        """Calculate the theoretical minimum II based on resource constraints."""
+        import math
+        
+        # Count operations by type in DFG
+        op_counts = {}
+        for node in self._dfg.get_nodes():
+            op_counts[node.operation] = op_counts.get(node.operation, 0) + 1
+            
+        # Count FUs capable of each operation
+        fu_capacity = {}
+        for fu in self._mrrg.get_fu_nodes():
+            for op in fu.supported_operations:
+                fu_capacity[op] = fu_capacity.get(op, 0) + 1
+                
+        # Calculate max required II across all operation types
+        min_ii = 1
+        for op, count in op_counts.items():
+            capacity = fu_capacity.get(op, 0)
+            if capacity == 0:
+                continue # Skip if unmapped or handled elsewhere
+            required_ii = math.ceil(count / capacity)
+            min_ii = max(min_ii, required_ii)
+            
+        return min_ii
 
-        Returns:
-            Dictionary with keys:
-                - status: 'success' or 'failed'
-                - placement: Dict[str, str] mapping DFG node IDs to MRRG node IDs
-                - routes: Dict with routing paths
-                - runtime: Total mapping time in seconds
-                - iterations: Number of place-and-route iterations performed
-                - final_cost: Final placement cost
-                - error_message: Error message if failed (optional)
-        """
+    def _map_with_ii(self) -> Dict[str, Any]:
+        """Run the mapping flow for the current MRRG's II."""
         start_time = time.time()
+        
+        # Phase 1: ASAP Scheduling
+        if self._debug:
+            print(f"\n=== Phase 1: ASAP Scheduling (II={self._mrrg.II}) ===")
 
-        try:
-            # Phase 1: ASAP Scheduling
-            if self._debug:
-                print("\n=== Phase 1: ASAP Scheduling ===")
-
-            success = self._run_asap_scheduling()
-            if not success:
-                return {
-                    'status': 'failed',
-                    'placement': None,
-                    'routes': None,
-                    'runtime': time.time() - start_time,
-                    'iterations': 0,
-                    'final_cost': 0.0,
-                    'error_message': 'ASAP scheduling failed'
-                }
-
-            # Phase 2: Iterative Place-and-Route
-            if self._debug:
-                print("\n=== Phase 2: Iterative Place-and-Route ===")
-
-            success = self._run_iterative_place_and_route()
-
-            runtime = time.time() - start_time
-
-            if success:
-                # Convert results to dict format
-                placement_dict = self._convert_placement_to_dict()
-                routing_dict = self._convert_routing_to_dict()
-
-                # Validate the solution
-                is_valid, validation_errors = self._validate_solution(
-                    placement_dict, routing_dict
-                )
-
-                return {
-                    'status': 'success',
-                    'placement': placement_dict,
-                    'routes': routing_dict,
-                    'runtime': runtime,
-                    'iterations': self._iterations_run,
-                    'final_cost': self._final_cost,
-                    'validation': {
-                        'is_valid': is_valid,
-                        'errors': validation_errors
-                    }
-                }
-            else:
-                # Determine error message based on failure reason
-                if self._timed_out:
-                    error_msg = f'Timeout after {runtime:.2f}s ({self._iterations_run} iterations)'
-                else:
-                    error_msg = f'Failed to route after {self._iterations_run} iterations'
-
-                return {
-                    'status': 'failed',
-                    'placement': None,
-                    'routes': None,
-                    'runtime': runtime,
-                    'iterations': self._iterations_run,
-                    'final_cost': self._final_cost,
-                    'error_message': error_msg
-                }
-
-        except Exception as e:
+        success = self._run_asap_scheduling()
+        if not success:
             return {
                 'status': 'failed',
                 'placement': None,
                 'routes': None,
                 'runtime': time.time() - start_time,
-                'iterations': self._iterations_run,
+                'iterations': 0,
                 'final_cost': 0.0,
-                'error_message': f'Mapping error: {str(e)}'
+                'error_message': f'ASAP scheduling failed at II={self._mrrg.II}'
             }
+
+        # Phase 2: Iterative Place-and-Route
+        if self._debug:
+            print(f"\n=== Phase 2: Iterative Place-and-Route (II={self._mrrg.II}) ===")
+
+        success = self._run_iterative_place_and_route()
+        runtime = time.time() - start_time
+
+        if success:
+            placement_dict = self._convert_placement_to_dict()
+            routing_dict = self._convert_routing_to_dict()
+            is_valid, validation_errors = self._validate_solution(placement_dict, routing_dict)
+
+            return {
+                'status': 'success',
+                'placement': placement_dict,
+                'routes': routing_dict,
+                'runtime': runtime,
+                'iterations': self._iterations_run,
+                'final_cost': self._final_cost,
+                'validation': {
+                    'is_valid': is_valid,
+                    'errors': validation_errors
+                }
+            }
+        else:
+            if self._timed_out:
+                error_msg = f'Timeout after {runtime:.2f}s ({self._iterations_run} iterations)'
+            else:
+                error_msg = f'Failed to route after {self._iterations_run} iterations'
+
+            return {
+                'status': 'failed',
+                'placement': None,
+                'routes': None,
+                'runtime': runtime,
+                'iterations': self._iterations_run,
+                'final_cost': self._final_cost,
+                'error_message': error_msg
+            }
+
+    def map(self, max_ii: int = 4) -> Dict[str, Any]:
+        """
+        Run the heuristic mapping flow with automatic II escalation.
+        
+        Args:
+            max_ii: Maximum Initiation Interval to attempt
+            
+        Returns:
+            Dictionary with mapping results across all II attempts
+        """
+        start_time = time.time()
+        
+        # Calculate theoretical minimum II
+        min_ii = self._calculate_min_ii()
+        current_ii = max(1, min_ii)
+        
+        if self._debug:
+            print(f"\nTheoretical minimum II: {min_ii}")
+            
+        # Time expand MRRG if starting II > 1
+        if current_ii > self._mrrg.II:
+            if self._debug:
+                print(f"Time-expanding MRRG to starting II={current_ii}...")
+            self._mrrg = self._mrrg.time_expand(current_ii)
+            
+        original_mrrg = self._mrrg
+        total_iterations = 0
+            
+        while current_ii <= max_ii:
+            print(f"\n{'='*50}")
+            print(f"Attempting mapping with II = {current_ii}")
+            print(f"{'='*50}")
+            
+            try:
+                result = self._map_with_ii()
+                total_iterations += result.get('iterations', 0)
+                
+                if result['status'] == 'success':
+                    result['runtime'] = time.time() - start_time
+                    result['iterations'] = total_iterations
+                    result['final_ii'] = current_ii
+                    print(f"\n[SUCCESS] Successfully mapped with II={current_ii}")
+                    return result
+                    
+                print(f"[FAILED] Mapping failed at II={current_ii}: {result.get('error_message', 'Unknown error')}")
+                
+                # Check if we should escalate II based on failure
+                # Escalating on any failure for now to guarantee we find a valid mapping if one exists
+                
+            except Exception as e:
+                print(f"[ERROR] Exception during mapping at II={current_ii}: {str(e)}")
+                
+            # Escalate II
+            current_ii += 1
+            if current_ii <= max_ii:
+                if self._debug:
+                    print(f"\nTime-expanding MRRG from II={current_ii-1} to II={current_ii}...")
+                self._mrrg = original_mrrg.time_expand(current_ii)
+                self._timed_out = False
+                
+        # Failed to map even at max_ii
+        return {
+            'status': 'failed',
+            'placement': None,
+            'routes': None,
+            'runtime': time.time() - start_time,
+            'iterations': total_iterations,
+            'final_cost': 0.0,
+            'error_message': f'Failed to map after exhausting all II up to {max_ii}'
+        }
 
     def _run_asap_scheduling(self) -> bool:
         """

@@ -77303,7 +77303,7 @@
       "module_type": "primitive",
       "latency": 1,
       "operation_count": 10,
-      "operations": ["add", "sub", "mul", "and", "or", "xor", "shl", "ashr", "lshr", "icmp"]
+      "operations": ["add", "sub", "mul", "and", "or", "xor", "shl", "ashr", "lshr", "icmp", "const", "phi", "input", "output", "load", "store", "br"]
     },
     {
       "module_name": "dice",

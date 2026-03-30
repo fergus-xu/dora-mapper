@@ -147,62 +147,55 @@ class AnnealPlacer:
             self.update_op_placement(op, self.get_random_unoccupied_fu(op))
 
     def get_random_fu(self, op: DFGNode) -> MRRGNode:
-        """Get a random FU node that can execute the given operation, which maybe occupied or not."""
+        """Get a random FU node that can execute the given operation, which may be occupied or not."""
 
-        # Get candidate FU nodes that can execute the operation at the given cycle
-        candidate_fu_nodes: List[MRRGNode] = self._temporal_op_type_to_fu_nodes[(op.operation, op.asap_time % self._ii)]
+        # Try all cycles, starting from the preferred cycle (asap_time % II)
+        preferred_cycle: int = op.asap_time % self._ii
+        cycles_to_try = [preferred_cycle] + [c for c in range(self._ii) if c != preferred_cycle]
 
-        # Check if there are any candidate FU nodes
-        if len(candidate_fu_nodes) < 1:
-            raise ValueError(f"No FU nodes found that can execute the operation {op.operation} at cycle {op.asap_time % self._ii}")
-        
-        # Grab a random FU node from the candidate FU nodes which is not reserved by the user.
-        random_fu_node: MRRGNode
+        for cycle in cycles_to_try:
+            key = (op.operation, cycle)
+            if key in self._temporal_op_type_to_fu_nodes:
+                candidate_fu_nodes: List[MRRGNode] = self._temporal_op_type_to_fu_nodes[key]
+                
+                # Filter out reserved nodes
+                available_fus = [fu for fu in candidate_fu_nodes if fu.id not in self._reserved_fu_nodes]
+                
+                if available_fus:
+                    # Return a random FU from the available ones in this cycle
+                    random_index: int = random.randint(0, len(available_fus) - 1)
+                    return available_fus[random_index]
 
-        # Set a max number of iterations to avoid infinite loop
-        max_iterations: int = 100000
-        iterations: int = 0
-        while True:
-            # Generate a random unsigned integer index in the range length of candidate_fu_nodes
-            random_index: int = random.randint(0, len(candidate_fu_nodes) - 1)
-            random_fu_node = candidate_fu_nodes[random_index]
-
-            # Check if the FU node is reserved by the user
-            if random_fu_node.id not in self._reserved_fu_nodes:
-                break
-
-            # Increment the iterations
-            iterations += 1
-
-            # Check if the maximum number of iterations is reached
-            if iterations >= max_iterations:
-                raise ValueError(f"Maximum number of iterations reached while trying to find a random FU node that is not reserved by the user for operation {op.operation} at cycle {op.asap_time % self._ii}")
-
-        return random_fu_node
+        raise ValueError(f"No FU nodes found that can execute the operation {op.operation} dynamically across II={self._ii} cycles")
 
     def get_random_unoccupied_fu(self, op: DFGNode) -> MRRGNode:
         """Get a random FU node that is not occupied."""
 
-        cycle: int = op.asap_time % self._ii
-        key = (op.operation, cycle)
-        candidate_fu_nodes: List[MRRGNode] = self._temporal_op_type_to_fu_nodes[key]
+        preferred_cycle: int = op.asap_time % self._ii
+        cycles_to_try = [preferred_cycle] + [c for c in range(self._ii) if c != preferred_cycle]
 
-        # Get all the unoccupied FU nodes
         unoccupied_fu_nodes: List[MRRGNode] = []
 
-        for fu_node in candidate_fu_nodes:
-            if self._fu_node_placement_state[fu_node].occupancy < fu_node.capacity:
-                unoccupied_fu_nodes.append(fu_node)
+        for cycle in cycles_to_try:
+            key = (op.operation, cycle)
+            if key in self._temporal_op_type_to_fu_nodes:
+                candidate_fu_nodes: List[MRRGNode] = self._temporal_op_type_to_fu_nodes[key]
+
+                for fu_node in candidate_fu_nodes:
+                    if fu_node.id not in self._reserved_fu_nodes and self._fu_node_placement_state[fu_node].occupancy < fu_node.capacity:
+                        unoccupied_fu_nodes.append(fu_node)
+            
+            # If we found unoccupied FUs in this cycle, we can stop searching other cycles
+            # to preserve ASAP hints where possible, or we could collect all for maximum mobility.
+            # Collecting all gives the annealer more flexibility to place nodes in other cycles.
+            # We'll continue the loop to collect them all.
 
         if len(unoccupied_fu_nodes) < 1:
-            raise ValueError(f"No unoccupied FU nodes found that can execute the operation {op.operation} at cycle {op.asap_time % self._ii}")
+            raise ValueError(f"No unoccupied FU nodes found that can execute the operation {op.operation} across all II={self._ii} cycles")
 
         # Grab a random FU node from the unoccupied FU nodes
-        random_fu_node: MRRGNode
         random_index: int = random.randint(0, len(unoccupied_fu_nodes) - 1)
-        random_fu_node = unoccupied_fu_nodes[random_index]
-
-        return random_fu_node
+        return unoccupied_fu_nodes[random_index]
 
     def clear_placement(self) -> None:
         """Clear the placement state for all the FU nodes."""

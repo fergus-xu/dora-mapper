@@ -920,6 +920,143 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                 path_map[(i, j)] = self.get_all_paths_between_fu_nodes(fu_nodes[i].id, fu_nodes[j].id)
         return path_map
 
+    def time_expand(self, new_ii: int) -> 'MRRG':
+        """
+        Create a time-expanded version of this MRRG.
+        
+        This expands the II=1 base MRRG to a new II by creating nodes for each cycle
+        and wiring them according to the CGRA-ME formulation.
+
+        Args:
+            new_ii: The new Initiation Interval (II) to expand to.
+
+        Returns:
+            A new MRRG instance expanded to the specified II.
+        """
+        if new_ii <= 0:
+            raise ValueError(f"Invalid II: {new_ii}")
+
+        # Create new empty MRRG with the same basic parameters
+        expanded = MRRG(f"{self.name}_II{new_ii}", new_ii, self.rows, self.cols)
+        debug = False
+        if debug:
+            print(f"Time-expanding MRRG from II={self.II} to II={new_ii}...")
+
+        # 1. Expand Functional Units
+        for fu in self.get_fu_nodes():
+            base_name = fu.id
+            if ':' in base_name: # Handle case where base MRRG already has cycle prefixes
+                base_name = base_name.split(':', 1)[1]
+                
+            expanded.create_time_expanded_fu(
+                base_name=base_name,
+                coordinates=fu.coordinates,
+                supported_operations=fu.supported_operations.copy(),
+                fu_latency=fu.latency,
+                bitwidth=fu.bitwidth,
+                fu_ii=1 # Default assumption for Dora
+            )
+
+        # 2. Expand Registers
+        for reg in self.get_register_nodes():
+            base_name = reg.id
+            if ':' in base_name:
+                base_name = base_name.split(':', 1)[1]
+            
+            expanded.create_time_expanded_register(
+                base_name=base_name,
+                coordinates=reg.coordinates,
+                bank_id=reg.bank_id,
+                reg_latency=reg.latency, # Typically 1
+                bitwidth=reg.bitwidth
+            )
+
+        # 3. Expand Pure Routing/Wire/Mux Nodes
+        for route_node in self.get_routing_nodes():
+            base_name = route_node.id
+            if ':' in base_name:
+                base_name = base_name.split(':', 1)[1]
+                
+            # specifically handle pure routing nodes (switches, network wires)
+            # Skip CGRA-ME generated internal pins to prevent duplicated re-expansion
+            if any(base_name.endswith(ext) for ext in ['.in', '.out', '.in_a', '.in_b', '.m_in', '.m_out', '.m_enable', '.reg']):
+                continue
+                
+            for cycle in range(new_ii):
+                new_id = f"{cycle}:{base_name}"
+                new_node = MRRGNode(
+                    node_id=new_id,
+                    node_type=route_node.node_type,
+                    cycle=cycle,
+                    coordinates=route_node.coordinates,
+                    hw_entity_type=route_node.hw_entity_type,
+                    latency=route_node.latency,
+                    bitwidth=route_node.bitwidth,
+                    bank_id=route_node.bank_id,
+                    supported_operations=route_node.supported_operations.copy() if route_node.supported_operations else None,
+                    supported_operand_tags=route_node.supported_operand_tags.copy() if route_node.supported_operand_tags else None,
+                    routing_type=route_node.routing_type
+                )
+                if not expanded.has_node(new_id):
+                    expanded.add_node(new_node)
+
+        # 4. Connect original topology across cycles
+        edge_count = 0
+        for edge in self.get_edges():
+            src_base = edge.source.id
+            dst_base = edge.destination.id
+            
+            # Remove any prefix from base graph
+            if ':' in src_base: src_base = src_base.split(':', 1)[1]
+            if ':' in dst_base: dst_base = dst_base.split(':', 1)[1]
+                
+            for cycle in range(new_ii):
+                # If source is an FU or Register, its outputs are exposed on its .out pin
+                src_probe = f"{cycle}:{src_base}.out"
+                if not expanded.has_node(src_probe):
+                    src_probe = f"{cycle}:{src_base}"
+                    
+                actual_src = expanded.get_node(src_probe)
+                if not actual_src:
+                    continue
+
+                # Destination cycle is source cycle + edge latency
+                dst_cycle = (cycle + edge.latency) % new_ii
+                
+                # If destination is an FU, its explicit inputs are .in_a and .in_b. 
+                # If it is a Register, its input is .in.
+                dst_probes = []
+                if expanded.has_node(f"{dst_cycle}:{dst_base}.in_a") and expanded.has_node(f"{dst_cycle}:{dst_base}.in_b"):
+                    dst_probes = [f"{dst_cycle}:{dst_base}.in_a", f"{dst_cycle}:{dst_base}.in_b"]
+                elif expanded.has_node(f"{dst_cycle}:{dst_base}.in"):
+                    dst_probes = [f"{dst_cycle}:{dst_base}.in"]
+                else:
+                    dst_probes = [f"{dst_cycle}:{dst_base}"]
+
+                for dst_probe in dst_probes:
+                    actual_dst = expanded.get_node(dst_probe)
+                    if not actual_dst:
+                        continue
+                        
+                    edge_id = f"{actual_src.id}_to_{actual_dst.id}"
+                    if not expanded.has_edge(edge_id):
+                        new_edge = MRRGEdge(
+                            edge_id=edge_id,
+                            source=actual_src,
+                            destination=actual_dst,
+                            latency=edge.latency
+                        )
+                        new_edge.capacity = edge.capacity
+                        new_edge.conflict_free = edge.conflict_free
+                        expanded.add_edge(new_edge)
+                        edge_count += 1
+                            
+        if debug:
+            print(f"Time expansion complete. New graph has {len(expanded.get_nodes())} nodes, {len(expanded.get_edges())} edges.")
+            
+        return expanded
+
+
     def get_k_shortest_paths_between_fu_nodes(self, start_node_id: str, end_node_id: str, k: int) -> List[List[str]]:
         """Get the k shortest paths between two FU nodes.
 
@@ -1115,21 +1252,26 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
         mrrg = cls(name=name, II=II)
 
         # Helper to determine node type
-        def get_node_type(kind: str, model: Optional[str]) -> NodeType:
+        def get_node_type(kind: str, node_id: str, model: Optional[str]) -> NodeType:
             """Map JSON 'kind' to NodeType."""
             if kind == "instance":
+                # known routing block instances in dice
+                n = node_id.lower()
+                if "xbar" in n or "sb" in n or "reg" in n:
+                    return NodeType.ROUTING
                 return NodeType.FUNCTION
             return NodeType.ROUTING
 
         # Helper to determine HW entity type
         def get_hw_entity_type(kind: str, node_id: str, model: Optional[str]) -> HWEntityType:
             """Map JSON fields to HWEntityType."""
+            n = node_id.lower()
             if kind == "instance":
+                if "reg" in n:
+                    return HWEntityType.HW_REG
+                elif "mux" in n or "xbar" in n or "sb" in n:
+                    return HWEntityType.HW_MUX
                 return HWEntityType.HW_COMB
-            elif "reg" in node_id.lower():
-                return HWEntityType.HW_REG
-            elif "mux" in node_id.lower() or "xbar" in node_id.lower():
-                return HWEntityType.HW_MUX
             return HWEntityType.HW_WIRE
 
         # Helper to parse coordinates
@@ -1176,7 +1318,7 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
             model = node_data.get("model")
             
             # Determine properties
-            node_type = get_node_type(kind, model)
+            node_type = get_node_type(kind, node_id, model)
             hw_entity_type = get_hw_entity_type(kind, node_id, model)
             coordinates = parse_coordinates(node_id)
             bitwidth = get_bitwidth(datatype)

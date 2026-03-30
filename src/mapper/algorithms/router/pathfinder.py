@@ -124,19 +124,52 @@ class PathFinder:
         # Debug mode
         self._debug = debug
 
-    def _compute_cycles_source_to_sink(self, source_node: DFGNode, sink_node: DFGNode, edge_dist: int = 0) -> int:
+    def _compute_cycles_source_to_sink(
+        self,
+        source_node: DFGNode,
+        sink_node: DFGNode,
+        edge_dist: int = 0,
+        src_fu: Optional[MRRGNode] = None,
+        sink_fu: Optional[MRRGNode] = None
+    ) -> int:
         """
-        Compute timing constraint from source to sink (static timing).
+        Compute routing timing constraint from source to sink.
+
+        In modulo scheduling (II > 1), uses actual placed MRRG FU cycles
+        to compute how many time-expanded MRRG hops are needed. 
+        Falls back to ASAP times for II=1.
 
         Args:
             source_node: Source DFG operation
             sink_node: Sink DFG operation
             edge_dist: Loop iteration distance (for loop-carried dependencies)
+            src_fu: Placed MRRG FU node for source (modulo scheduling)
+            sink_fu: Placed MRRG FU node for sink (modulo scheduling)
 
         Returns:
             Required latency in cycles from source to sink
         """
-        # Get scheduled times
+        II = self._mrrg.II
+
+        # Use placement-based cycles when in modulo scheduling mode
+        if src_fu is not None and sink_fu is not None and II is not None and II > 1:
+            src_cycle = src_fu.cycle
+            sink_cycle = sink_fu.cycle
+
+            # Self-loop: wrap around the full II
+            if source_node == sink_node:
+                return II
+
+            # Modular distance: how many cycles to go from src to sink in the II ring
+            cycles_to_sink = (sink_cycle - src_cycle) % II
+
+            # Loop-carried edges add full II iterations
+            if edge_dist > 0:
+                cycles_to_sink += edge_dist * II
+
+            return cycles_to_sink
+
+        # Fallback: use ASAP scheduling times (works for II=1)
         source_time = source_node.asap_time
         sink_time = sink_node.asap_time
 
@@ -146,25 +179,19 @@ class PathFinder:
                 f"{sink_node.id} (t={sink_time})"
             )
 
-        # Base difference
         cycles_to_sink = sink_time - source_time
 
-        # Get initiation interval
-        II = self._mrrg.II
-
-        # Backward edges: wrap around using modulo arithmetic
         if II is not None and cycles_to_sink < 0:
             cycles_to_sink = II - (abs(cycles_to_sink) % II)
 
         if II is not None and sink_node == source_node:
             cycles_to_sink = II
 
-        # Handle loop-carried dependencies
-        if edge_dist > 0:
-            if II is not None:
-                cycles_to_sink += edge_dist * II
+        if edge_dist > 0 and II is not None:
+            cycles_to_sink += edge_dist * II
 
         return cycles_to_sink
+
 
     def _compute_cost(self, node: MRRGNode) -> float:
         """
@@ -698,9 +725,12 @@ class PathFinder:
                     print(f"  [SKIP] Self-loop detected for {hyperval.source_id} -> {dest_id} (loop-back edge)")
                 continue
 
-            # Get timing constraint
+            # Get timing constraint using placement-based cycles
             edge_dist = hyperval.dists[dest_idx] if hyperval.dists[dest_idx] is not None else 0
-            cycles_to_sink = self._compute_cycles_source_to_sink(src_dfg_node, dest_dfg_node, edge_dist)
+            cycles_to_sink = self._compute_cycles_source_to_sink(
+                src_dfg_node, dest_dfg_node, edge_dist, src_fu=src_fu, sink_fu=sink_fu
+            )
+
 
             # Get operand tag
             operand_str = hyperval.operands[dest_idx]

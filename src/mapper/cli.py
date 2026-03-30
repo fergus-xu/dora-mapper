@@ -48,7 +48,8 @@ def cmd_map(args: argparse.Namespace) -> int:
     print(f"Loading DFG from {args.dfg}...")
     parser = DFGDotParser()
     dfg = parser.parse(args.dfg)
-    print(f"  Loaded {dfg.num_nodes()} nodes, {dfg.num_edges()} edges")
+    dfg.preprocess_for_scheduling()
+    print(f"  Processed {dfg.num_nodes()} nodes, {dfg.num_edges()} edges")
 
     # Load MRRG from JSON file
     if not args.mrrg.exists():
@@ -131,10 +132,19 @@ def cmd_map(args: argparse.Namespace) -> int:
                 
             # Calculate cycle routing latency using MRRG shortest paths
             path_latencies = []
+            if not hasattr(mrrg, '_path_cache'):
+                mrrg._path_cache = {}
+                
             for s_fu in src_fus:
                 for d_fu in sink_fus:
-                    # k=1 gives the absolute shortest path between this specific src/sink pair
-                    paths = mrrg.get_k_shortest_paths_between_fu_nodes_optimized(s_fu.id, d_fu.id, k=1)
+                    cache_key = (s_fu.id, d_fu.id)
+                    if cache_key not in mrrg._path_cache:
+                        # k=1 gives the absolute shortest path between this specific src/sink pair
+                        paths = mrrg.get_k_shortest_paths_between_fu_nodes_optimized(s_fu.id, d_fu.id, k=1)
+                        mrrg._path_cache[cache_key] = paths
+                    
+                    paths = mrrg._path_cache[cache_key]
+                    
                     if paths and len(paths[0]) > 0:
                         shortest_path = paths[0]
                         # Combinational wire latency=0, register latency=1.
@@ -148,12 +158,12 @@ def cmd_map(args: argparse.Namespace) -> int:
             
             if path_latencies:
                 # Bound between the fastest path we found and the slowest "fastest" path + 1
-                min_lat = max(1, min(path_latencies))
-                max_lat = max(2, max(path_latencies) + 1)
+                min_lat = min(path_latencies)
+                max_lat = max(path_latencies) + 1
                 network_latencies[OperationLatencyEdge(src, sink)] = (min_lat, max_lat)
             else:
                 # Fall back on (1, 2) if no paths found
-                network_latencies[OperationLatencyEdge(src, sink)] = (1, 2)
+                network_latencies[OperationLatencyEdge(src, sink)] = (0, 1)
     
     latency_spec = LatencySpecification(
         op_latencies=op_latencies,
@@ -191,6 +201,15 @@ def cmd_map(args: argparse.Namespace) -> int:
 
     # Save results if requested
     if args.output and result['status'] == 'success':
+        def serialize_keys(d):
+            if isinstance(d, dict):
+                return {str(k): serialize_keys(v) for k, v in d.items()}
+            elif isinstance(d, list):
+                return [serialize_keys(i) for i in d]
+            elif isinstance(d, tuple):
+                return tuple(serialize_keys(i) for i in d)
+            return d
+
         output_data = {
             'status': result['status'],
             'placement': result['placement'],
@@ -199,6 +218,7 @@ def cmd_map(args: argparse.Namespace) -> int:
             'iterations': result['iterations'],
             'final_cost': result.get('final_cost', 0),
         }
+        output_data = serialize_keys(output_data)
         with open(args.output, 'w') as f:
             json.dump(output_data, f, indent=2)
         print(f"\nSaved results to {args.output}")
