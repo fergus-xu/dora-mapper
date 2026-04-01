@@ -179,7 +179,7 @@ class HeuristicMapper:
                 'error_message': error_msg
             }
 
-    def map(self, max_ii: int = 4) -> Dict[str, Any]:
+    def map(self, max_ii: int = 32) -> Dict[str, Any]:
         """
         Run the heuristic mapping flow with automatic II escalation.
         

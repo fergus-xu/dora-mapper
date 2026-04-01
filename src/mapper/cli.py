@@ -97,14 +97,30 @@ def cmd_map(args: argparse.Namespace) -> int:
     if compiler_arch_path:
         with open(compiler_arch_path, 'r') as f:
             compiler_arch = json.load(f)
+        # Dora API structure: list of module capability objects
         for cap in compiler_arch.get("module_operation_capabilities", []):
-            module_latency = cap.get("latency", 0)
-            for op_str in cap.get("operations", []):
+            # Check for Dora "bindings" structure
+            bindings = cap.get("bindings", [])
+            for binding in bindings:
+                op_str = binding.get("optype", "")
+                op_latency = binding.get("latency", 1)
+                
                 for op_enum in OperationType:
+                    # Match by name or Dora-style optype string
                     if op_enum.name == op_str.upper() or op_enum.value.lower() == op_str.lower():
                         if op_enum not in op_latencies:
-                            op_latencies[op_enum] = module_latency
+                            op_latencies[op_enum] = op_latency
                         break
+            
+            # Legacy support (Dice)
+            if not bindings:
+                module_latency = cap.get("latency", 0)
+                for op_str in cap.get("operations", []):
+                    for op_enum in OperationType:
+                        if op_enum.name == op_str.upper() or op_enum.value.lower() == op_str.lower():
+                            if op_enum not in op_latencies:
+                                op_latencies[op_enum] = module_latency
+                            break
 
     # Final fallback for missing operations to prevent crashes
     for op_enum in OperationType:
@@ -157,13 +173,16 @@ def cmd_map(args: argparse.Namespace) -> int:
                         path_latencies.append(latency)
             
             if path_latencies:
-                # Bound between the fastest path we found and the slowest "fastest" path + 1
+                # Bound between the fastest path we found and a much larger upper bound
+                # to allow the scheduler flexibility (especially for loop-backs).
                 min_lat = min(path_latencies)
-                max_lat = max(path_latencies) + 1
+                # Using a large upper bound (e.g., II + 10 or just a large constant) 
+                # ensures ASAP doesn't fail prematurely.
+                max_lat = max(path_latencies) + 20 
                 network_latencies[OperationLatencyEdge(src, sink)] = (min_lat, max_lat)
             else:
-                # Fall back on (1, 2) if no paths found
-                network_latencies[OperationLatencyEdge(src, sink)] = (0, 1)
+                # Fall back on (0, 20) if no paths found
+                network_latencies[OperationLatencyEdge(src, sink)] = (0, 20)
     
     latency_spec = LatencySpecification(
         op_latencies=op_latencies,
@@ -183,7 +202,7 @@ def cmd_map(args: argparse.Namespace) -> int:
         debug=args.debug,
     )
 
-    result = mapper.map()
+    result = mapper.map(max_ii=args.max_ii)
 
     # Print results
     print("\n" + "="*60)
@@ -250,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     p_map.add_argument("--max-iterations", type=int, default=1000, help="Max place-and-route iterations")
     p_map.add_argument("--temperature", type=float, default=1000.0, help="Initial annealing temperature")
     p_map.add_argument("--max-time", type=float, default=None, help="Max runtime in seconds")
+    p_map.add_argument("--max-ii", type=int, default=32, help="Maximum Initiation Interval to attempt")
     p_map.add_argument("--seed", type=int, default=42, help="Random seed")
     p_map.add_argument("--debug", action="store_true", help="Enable debug output")
 
