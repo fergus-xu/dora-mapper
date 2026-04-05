@@ -217,21 +217,43 @@ class MappingVerifier:
     def check_route_endpoints(self):
         """Verify route start/end nodes match their placed FUs."""
         print("\n[7] Route Endpoint Consistency")
+        import ast
+
+        def _extract_first_node(path_obj):
+            """Support both flat paths and nested fractured subpaths."""
+            if not path_obj:
+                return None
+            first = path_obj[0]
+            if isinstance(first, list):
+                for sub in path_obj:
+                    if sub:
+                        return sub[0]
+                return None
+            return first
+
         mismatched = []
         for key, path in self.routes.items():
             try:
-                parts = key.strip("()").split(",")
-                src_op = parts[0].strip().strip("'\"")
-            except (ValueError, IndexError):
+                parsed_key = ast.literal_eval(key)
+                src_op = parsed_key[0]
+            except (ValueError, IndexError, SyntaxError):
                 continue
 
             src_fu = self.placement.get(src_op)
-            if not src_fu or not path:
+            first_node = _extract_first_node(path)
+            if not src_fu or not first_node:
                 continue
 
-            # The route's first node should be the source FU's output port
-            if src_fu not in path[0]:
-                mismatched.append((key, f"start {path[0]} ≠ {src_fu}"))
+            # Accept either:
+            # 1) string-prefix style IDs where first route node embeds source FU ID
+            # 2) explicit MRRG edge from source FU to first route node
+            if src_fu in first_node:
+                continue
+
+            outgoing = self.mrrg.get_outgoing_edges(src_fu)
+            neighbor_ids = {e.destination.id for e in outgoing}
+            if first_node not in neighbor_ids:
+                mismatched.append((key, f"start {first_node} not reachable from {src_fu}"))
 
         self._check(
             len(mismatched) == 0,

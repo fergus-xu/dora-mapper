@@ -52,6 +52,9 @@ class SinkAndLatency:
     # Sink FU node in MRRG
     sink_fu: 'MRRGNode'
 
+    # Maximum allowed cycles to sink with timing slack
+    max_cycles_to_sink: int
+
     # Required operand tag
     operand_tag: Optional['OperandTag'] = None
 
@@ -148,6 +151,9 @@ class VertexAndCost:
 
     # The MRRG node
     node: 'MRRGNode' = field(compare=False)
+
+    # Whether the required tag has been satisfied on this path state
+    tag_found: bool = field(default=False, compare=False)
 
     def __hash__(self):
         """Allow use in sets."""

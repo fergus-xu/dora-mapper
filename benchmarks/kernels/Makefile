@@ -16,6 +16,9 @@ KERNEL       ?= sum
 DOT          ?= graph_loop.dot
 # ARCH is the relative path from benchmarks/kernels to the architecture directory
 ARCH         ?= ../architectures/vanilla_hycube/II_1
+MAX_ITERATIONS ?= 1
+MAX_II         ?= 32
+PYTHON         ?= python3
 
 # ── Paths (relative to repo root) ─────────────────────────
 SHELL        := /bin/bash
@@ -66,10 +69,12 @@ $(KERNEL_JSON): $(DOT_FILE)
 	@echo "═══════════════════════════════════════════"
 	@mkdir -p $(RESULTS_DIR)
 	set -o pipefail
-	python $(MAPPER) map \
+	PYTHONPATH="$(ROOT)/src:$${PYTHONPATH}" PYTHONUNBUFFERED=1 $(PYTHON) -u $(MAPPER) map \
 		$(DOT_FILE) \
 		$(MRRG) \
 		--compiler-arch $(COMPILER_ARCH) \
+		--max-iterations $(MAX_ITERATIONS) \
+		--max-ii $(MAX_II) \
 		--output $(KERNEL_JSON) \
 		| tee $(RESULTS_LOG) && \
 	(echo "" && echo "✓ Outputs written to $(RESULTS_DIR)/")
@@ -83,7 +88,7 @@ test: ## Verify mapping correctness
 	@echo "═══════════════════════════════════════════"
 	@echo " Verifying mapping: $(KERNEL)"
 	@echo "═══════════════════════════════════════════"
-	python $(VERIFIER) \
+	PYTHONPATH="$(ROOT)/src:$${PYTHONPATH}" $(PYTHON) $(VERIFIER) \
 		$(KERNEL_JSON) \
 		$(DOT_FILE) \
 		$(MRRG) \

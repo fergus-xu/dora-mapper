@@ -129,60 +129,63 @@ def cmd_map(args: argparse.Namespace) -> int:
 
     # NETWORK LATENCIES
     # Calculate routing latencies using topological shortest paths on the MRRG.
+    # Runtime optimization: only compute latencies for operation pairs that
+    # actually appear on DFG edges (instead of all OperationType x OperationType).
     network_latencies = {}
-    for src in OperationType:
-        if src == OperationType.OUTPUT:
-            continue
-        src_fus = mrrg.get_compatible_fus(src)
+    required_op_pairs = {
+        (edge.source.operation, edge.destination.operation)
+        for edge in dfg.get_edges()
+    }
 
-        for sink in OperationType:
-            if sink == OperationType.INPUT:
-                continue
-                
-            sink_fus = mrrg.get_compatible_fus(sink)
-            
-            # If we don't have compatible FUs for either, fallback to default (1, 2)
-            if not src_fus or not sink_fus:
-                network_latencies[OperationLatencyEdge(src, sink)] = (1, 2)
-                continue
-                
-            # Calculate cycle routing latency using MRRG shortest paths
-            path_latencies = []
-            if not hasattr(mrrg, '_path_cache'):
-                mrrg._path_cache = {}
-                
-            for s_fu in src_fus:
-                for d_fu in sink_fus:
-                    cache_key = (s_fu.id, d_fu.id)
-                    if cache_key not in mrrg._path_cache:
-                        # k=1 gives the absolute shortest path between this specific src/sink pair
-                        paths = mrrg.get_k_shortest_paths_between_fu_nodes_optimized(s_fu.id, d_fu.id, k=1)
-                        mrrg._path_cache[cache_key] = paths
-                    
-                    paths = mrrg._path_cache[cache_key]
-                    
-                    if paths and len(paths[0]) > 0:
-                        shortest_path = paths[0]
-                        # Combinational wire latency=0, register latency=1.
-                        # Sum the true pipeline stage latency of the intermediate path.
-                        latency = sum(
-                            mrrg.get_node(node_id).latency 
-                            for node_id in shortest_path[1:-1] 
-                            if mrrg.get_node(node_id)
-                        )
-                        path_latencies.append(latency)
-            
-            if path_latencies:
-                # Bound between the fastest path we found and a much larger upper bound
-                # to allow the scheduler flexibility (especially for loop-backs).
-                min_lat = min(path_latencies)
-                # Using a large upper bound (e.g., II + 10 or just a large constant) 
-                # ensures ASAP doesn't fail prematurely.
-                max_lat = max(path_latencies) + 20 
-                network_latencies[OperationLatencyEdge(src, sink)] = (min_lat, max_lat)
-            else:
-                # Fall back on (0, 20) if no paths found
-                network_latencies[OperationLatencyEdge(src, sink)] = (0, 20)
+    if args.debug:
+        print(f"  Computing network latencies for {len(required_op_pairs)} DFG op-pairs")
+
+    for src, sink in required_op_pairs:
+        src_fus = mrrg.get_compatible_fus(src)
+        sink_fus = mrrg.get_compatible_fus(sink)
+
+        # If we don't have compatible FUs for either, fallback to default (1, 2)
+        if not src_fus or not sink_fus:
+            network_latencies[OperationLatencyEdge(src, sink)] = (1, 2)
+            continue
+
+        # Calculate cycle routing latency using MRRG shortest paths
+        path_latencies = []
+        if not hasattr(mrrg, '_path_cache'):
+            mrrg._path_cache = {}
+
+        for s_fu in src_fus:
+            for d_fu in sink_fus:
+                cache_key = (s_fu.id, d_fu.id)
+                if cache_key not in mrrg._path_cache:
+                    # k=1 gives the absolute shortest path between this specific src/sink pair
+                    paths = mrrg.get_k_shortest_paths_between_fu_nodes_optimized(s_fu.id, d_fu.id, k=1)
+                    mrrg._path_cache[cache_key] = paths
+
+                paths = mrrg._path_cache[cache_key]
+
+                if paths and len(paths[0]) > 0:
+                    shortest_path = paths[0]
+                    # Combinational wire latency=0, register latency=1.
+                    # Sum the true pipeline stage latency of the intermediate path.
+                    latency = sum(
+                        mrrg.get_node(node_id).latency
+                        for node_id in shortest_path[1:-1]
+                        if mrrg.get_node(node_id)
+                    )
+                    path_latencies.append(latency)
+
+        if path_latencies:
+            # Bound between the fastest path we found and a much larger upper bound
+            # to allow the scheduler flexibility (especially for loop-backs).
+            min_lat = min(path_latencies)
+            # Using a large upper bound (e.g., II + 10 or just a large constant)
+            # ensures ASAP doesn't fail prematurely.
+            max_lat = max(path_latencies) + 20
+            network_latencies[OperationLatencyEdge(src, sink)] = (min_lat, max_lat)
+        else:
+            # Fall back on (0, 20) if no paths found
+            network_latencies[OperationLatencyEdge(src, sink)] = (0, 20)
     
     latency_spec = LatencySpecification(
         op_latencies=op_latencies,
@@ -199,6 +202,11 @@ def cmd_map(args: argparse.Namespace) -> int:
         max_iterations=args.max_iterations,
         max_time=args.max_time,
         random_seed=args.seed,
+        router_max_iterations=args.router_max_iterations,
+        bitwidth_mismatch_penalty_weight=args.bitwidth_mismatch_penalty_weight,
+        placement_restart_patience=args.placement_restart_patience,
+        max_placement_restarts=args.max_placement_restarts,
+        ii_iteration_patience=args.ii_iteration_patience,
         debug=args.debug,
     )
 
@@ -270,6 +278,11 @@ def main(argv: list[str] | None = None) -> int:
     p_map.add_argument("--temperature", type=float, default=1000.0, help="Initial annealing temperature")
     p_map.add_argument("--max-time", type=float, default=None, help="Max runtime in seconds")
     p_map.add_argument("--max-ii", type=int, default=32, help="Maximum Initiation Interval to attempt")
+    p_map.add_argument("--router-max-iterations", type=int, default=30, help="PathFinder negotiated-congestion iterations")
+    p_map.add_argument("--bitwidth-mismatch-penalty-weight", type=float, default=0.5, help="Soft routing penalty for using wider-than-needed NoC bitwidth")
+    p_map.add_argument("--placement-restart-patience", type=int, default=3, help="Placement retries before fresh restart")
+    p_map.add_argument("--max-placement-restarts", type=int, default=4, help="Maximum fresh placement restarts per II")
+    p_map.add_argument("--ii-iteration-patience", type=int, default=12, help="No-coverage-improvement placement iterations before escalating II")
     p_map.add_argument("--seed", type=int, default=42, help="Random seed")
     p_map.add_argument("--debug", action="store_true", help="Enable debug output")
 

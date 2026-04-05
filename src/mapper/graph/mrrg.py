@@ -963,14 +963,20 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                 src_base = edge.source.id.split(':', 1)[1] if ':' in edge.source.id else edge.source.id
                 dst_base = edge.destination.id.split(':', 1)[1] if ':' in edge.destination.id else edge.destination.id
                 
-                edge_key = (src_base, dst_base, edge.latency)
+                # Dora MRRGs often encode pipeline delay on nodes (e.g., registers/LSUs)
+                # while edge time deltas are all 0 in II=1.
+                # Preserve cycle reachability by advancing destination cycle by node latency
+                # when edge latency is not explicitly positive.
+                effective_latency = edge.latency if edge.latency > 0 else max(0, edge.source.latency)
+
+                edge_key = (src_base, dst_base, effective_latency)
                 if edge_key in processed_edges:
                     continue
                 processed_edges.add(edge_key)
                 
                 for cycle in range(new_ii):
                     # Edge latency determines the cycle jump (modulo scheduled)
-                    dst_cycle = (cycle + edge.latency) % new_ii
+                    dst_cycle = (cycle + effective_latency) % new_ii
                     
                     src_new = f"{cycle}:{src_base}"
                     dst_new = f"{dst_cycle}:{dst_base}"
@@ -980,7 +986,7 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                             edge_id=f"{src_new}_to_{dst_new}",
                             source=expanded.get_node(src_new),
                             destination=expanded.get_node(dst_new),
-                            latency=edge.latency
+                            latency=effective_latency
                         )
                         new_edge.capacity = edge.capacity
                         expanded.add_edge(new_edge)
@@ -1306,6 +1312,59 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
             "nop": OperationType.NOP,
         }
 
+        DORA_OP_ALIASES = {
+            "LOAD": "LD",
+            "STORE": "ST",
+            "SHL": "LSL",
+            "SHR": "LSR",
+            "SAR": "ASR",
+            "CMP": "ICMP",
+        }
+
+        def map_dora_operation(optype: str, operation_id: str = "") -> Optional[OperationType]:
+            """Map Dora operation strings to mapper OperationType with aliases/fallbacks."""
+            if not optype:
+                optype = ""
+
+            # Fast path: existing direct map (supports mixed case keys already).
+            if optype in DORA_OPTYPE_MAP:
+                return DORA_OPTYPE_MAP[optype]
+
+            norm = optype.strip().upper()
+            if norm in DORA_OP_ALIASES:
+                norm = DORA_OP_ALIASES[norm]
+
+            if norm in DORA_OPTYPE_MAP:
+                return DORA_OPTYPE_MAP[norm]
+
+            # Enum-name fallback
+            try:
+                return OperationType[norm]
+            except (KeyError, ValueError):
+                pass
+
+            # Enum-value fallback
+            for op_enum in OperationType:
+                if op_enum.value.lower() == norm.lower():
+                    return op_enum
+
+            # Last-resort fallback from operation_id tokens (e.g., hycube.mem.load.i32)
+            if operation_id:
+                for token in operation_id.replace('-', '.').split('.'):
+                    token_norm = token.strip().upper()
+                    if not token_norm:
+                        continue
+                    if token_norm in DORA_OP_ALIASES:
+                        token_norm = DORA_OP_ALIASES[token_norm]
+                    if token_norm in DORA_OPTYPE_MAP:
+                        return DORA_OPTYPE_MAP[token_norm]
+                    try:
+                        return OperationType[token_norm]
+                    except (KeyError, ValueError):
+                        continue
+
+            return None
+
         # Load JSON file
         with open(json_file_path, 'r') as f:
             data = json.load(f)
@@ -1330,14 +1389,10 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                     op_set = set()
                     for binding in bindings:
                         op_str = binding.get("optype", "")
-                        if op_str in DORA_OPTYPE_MAP:
-                            op_set.add(DORA_OPTYPE_MAP[op_str])
-                        else:
-                            # Fallback: try direct OperationType lookup by name
-                            try:
-                                op_set.add(OperationType[op_str.upper()])
-                            except (KeyError, ValueError):
-                                pass  # Silently skip unknown operations
+                        operation_id = binding.get("operation_id", "")
+                        mapped_op = map_dora_operation(op_str, operation_id)
+                        if mapped_op is not None:
+                            op_set.add(mapped_op)
                     
                     if op_set:
                         module_operations_map[module_name] = op_set
@@ -1407,20 +1462,40 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                 else:
                     bitwidth = 32
             
-            # Latency detection
-            latency = node_data.get("latency", 0)
+            # Check explicit "operations" field first (new Dora feature)
+            json_ops = node_data.get("operations", [])
+
+            # Latency detection:
+            # 1) explicit top-level node latency
+            # 2) per-operation scheduling latency in Dora API
+            # 3) sane default (registers=1, others=0)
+            latency = node_data.get("latency")
+            if latency is None:
+                latency = 0
+
+            if latency == 0 and json_ops:
+                sched_lats = []
+                for op_entry in json_ops:
+                    scheduling = op_entry.get("scheduling", {})
+                    lat_cycles = scheduling.get("latency_cycles")
+                    if isinstance(lat_cycles, int):
+                        sched_lats.append(lat_cycles)
+                if sched_lats:
+                    # Be conservative for timing correctness.
+                    latency = max(sched_lats)
+
             if latency == 0 and hw_entity_type == HWEntityType.HW_REG:
                 latency = 1 # Default for registers if unspecified
             
             # Gather supported operations
             supported_operations = set()
             
-            # Check explicit "operations" field first (new Dora feature)
-            json_ops = node_data.get("operations", [])
             for op_entry in json_ops:
                 op_str = op_entry.get("optype", "")
-                if op_str in DORA_OPTYPE_MAP:
-                    supported_operations.add(DORA_OPTYPE_MAP[op_str])
+                operation_id = op_entry.get("operation_id", "")
+                mapped_op = map_dora_operation(op_str, operation_id)
+                if mapped_op is not None:
+                    supported_operations.add(mapped_op)
             
             # If no explicit ops, fall back to module_operations_map from compiler_arch
             if not supported_operations and model:
@@ -1432,17 +1507,28 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                         if m_name in model or model in m_name:
                             supported_operations = ops
                             break
+
+            # Compatibility shim:
+            # DFGs often retain PHI/SELECT pseudo-ops even when HyCUBE API does not
+            # list them explicitly. Restrict this augmentation to ALU-like compute units
+            # only, instead of the previous blanket add-to-all-function-units behavior.
+            if node_type == NodeType.FUNCTION:
+                model_l = (model or "").lower()
+                node_class_l = str(node_data.get("node_class", "")).lower()
+                is_alu_like = (
+                    ("alu" in model_l)
+                    or (
+                        node_class_l == "functional_unit"
+                        and not any(tok in model_l for tok in ("const", "lsu", "mem", "iopad", "io"))
+                    )
+                )
+                if is_alu_like:
+                    supported_operations.add(OperationType.PHI)
+                    supported_operations.add(OperationType.SELECT)
             
             # Create full node ID with time prefix: "cycle:base_id"
             # This is critical for the mapper's expectation of unique time-expanded IDs
             full_node_id = f"{time}:{node_id}"
-            
-            # Automatically add PHI and SELECT support to all functional units
-            # Dora architectures often don't explicitly list these, but they are 
-            # required for the mapper's DFG which preserves PHI nodes.
-            if node_type == NodeType.FUNCTION:
-                supported_operations.add(OperationType.PHI)
-                supported_operations.add(OperationType.SELECT)
             
             mrrg_node = MRRGNode(
                 node_id=full_node_id,
@@ -1452,7 +1538,11 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                 hw_entity_type=hw_entity_type,
                 latency=latency,
                 bitwidth=bitwidth,
-                supported_operations=supported_operations
+                supported_operations=supported_operations,
+                model=model,
+                datatype=datatype,
+                dora_kind=node_data.get("kind"),
+                dora_node_class=node_data.get("node_class")
             )
             
             mrrg.add_node(mrrg_node)
