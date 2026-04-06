@@ -31,7 +31,8 @@ def load_dfg(dot_path: str) -> DFG:
     """Load and preprocess the DFG."""
     parser = DFGDotParser()
     dfg = parser.parse(Path(dot_path))
-    dfg.preprocess_for_scheduling()
+    # Keep verifier preprocessing identical to mapper CLI behavior.
+    dfg.preprocess_for_mapping()
     return dfg
 
 

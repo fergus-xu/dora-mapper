@@ -105,6 +105,7 @@ class HeuristicMapper:
         # Results
         self._placement: Optional[Dict[DFGNode, MRRGNode]] = None
         self._routing_solution = None
+        self._route_metadata: Optional[Dict[Tuple[str, int], Dict[str, Any]]] = None
         self._iterations_run = 0
         self._final_cost = 0.0
         self._timed_out = False
@@ -158,6 +159,7 @@ class HeuristicMapper:
                 'status': 'failed',
                 'placement': None,
                 'routes': None,
+                'route_metadata': None,
                 'runtime': time.time() - start_time,
                 'iterations': 0,
                 'final_cost': 0.0,
@@ -180,6 +182,7 @@ class HeuristicMapper:
                 'status': 'success',
                 'placement': placement_dict,
                 'routes': routing_dict,
+                'route_metadata': self._route_metadata,
                 'runtime': runtime,
                 'iterations': self._iterations_run,
                 'final_cost': self._final_cost,
@@ -198,6 +201,7 @@ class HeuristicMapper:
                 'status': 'failed',
                 'placement': None,
                 'routes': None,
+                'route_metadata': None,
                 'runtime': runtime,
                 'iterations': self._iterations_run,
                 'final_cost': self._final_cost,
@@ -272,6 +276,7 @@ class HeuristicMapper:
             'status': 'failed',
             'placement': None,
             'routes': None,
+            'route_metadata': None,
             'runtime': time.time() - start_time,
             'iterations': total_iterations,
             'final_cost': 0.0,
@@ -314,6 +319,7 @@ class HeuristicMapper:
         """
         # Track start time for timeout checking
         start_time = time.time()
+        self._route_metadata = None
 
         def _make_placer(seed: int) -> AnnealPlacer:
             return AnnealPlacer(
@@ -390,6 +396,7 @@ class HeuristicMapper:
             if routing_success:
                 # Success! Save routing solution and exit
                 self._routing_solution = router._routing_solution
+                self._route_metadata = router.get_route_metadata()
 
                 if self._debug:
                     print(f"\n✓ Routing succeeded at iteration {self._iterations_run}")

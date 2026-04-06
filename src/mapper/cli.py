@@ -48,7 +48,7 @@ def cmd_map(args: argparse.Namespace) -> int:
     print(f"Loading DFG from {args.dfg}...")
     parser = DFGDotParser()
     dfg = parser.parse(args.dfg)
-    dfg.preprocess_for_scheduling()
+    dfg.preprocess_for_mapping()
     print(f"  Processed {dfg.num_nodes()} nodes, {dfg.num_edges()} edges")
 
     # Load MRRG from JSON file
@@ -192,25 +192,32 @@ def cmd_map(args: argparse.Namespace) -> int:
         network_latencies=network_latencies
     )
 
+    def _build_mapper() -> HeuristicMapper:
+        return HeuristicMapper(
+            dfg=dfg,
+            mrrg=mrrg,
+            latency_spec=latency_spec,
+            initial_temperature=args.temperature,
+            max_iterations=args.max_iterations,
+            max_time=args.max_time,
+            random_seed=args.seed,
+            router_max_iterations=args.router_max_iterations,
+            bitwidth_mismatch_penalty_weight=args.bitwidth_mismatch_penalty_weight,
+            placement_restart_patience=args.placement_restart_patience,
+            max_placement_restarts=args.max_placement_restarts,
+            ii_iteration_patience=args.ii_iteration_patience,
+            debug=args.debug,
+        )
+
+    def _run_mapping(start_ii: int | None, max_ii: int):
+        mapper = _build_mapper()
+        if start_ii is not None:
+            mapper._calculate_min_ii = lambda ii=start_ii: ii  # type: ignore[attr-defined]
+        return mapper.map(max_ii=max_ii)
+
     # Create and run mapper
     print(f"\nRunning heuristic mapper (max_iterations={args.max_iterations})...")
-    mapper = HeuristicMapper(
-        dfg=dfg,
-        mrrg=mrrg,
-        latency_spec=latency_spec,
-        initial_temperature=args.temperature,
-        max_iterations=args.max_iterations,
-        max_time=args.max_time,
-        random_seed=args.seed,
-        router_max_iterations=args.router_max_iterations,
-        bitwidth_mismatch_penalty_weight=args.bitwidth_mismatch_penalty_weight,
-        placement_restart_patience=args.placement_restart_patience,
-        max_placement_restarts=args.max_placement_restarts,
-        ii_iteration_patience=args.ii_iteration_patience,
-        debug=args.debug,
-    )
-
-    result = mapper.map(max_ii=args.max_ii)
+    result = _run_mapping(start_ii=None, max_ii=args.max_ii)
 
     # Print results
     print("\n" + "="*60)
@@ -225,6 +232,88 @@ def cmd_map(args: argparse.Namespace) -> int:
     else:
         print(f"Error: {result.get('error_message', 'Unknown error')}")
     print("="*60)
+
+    if result["status"] == "success" and args.fasm_output:
+        if not args.compiler_arch:
+            print(
+                "error: --fasm-output requires --compiler-arch (compiler_arch.json)",
+                file=sys.stderr,
+            )
+            return 1
+        validation = result.get("validation", {})
+        if validation and not validation.get("is_valid", True):
+            print("error: FASM generation blocked because mapping validation failed", file=sys.stderr)
+            for err in validation.get("errors", []):
+                print(f"  validation error: {err}", file=sys.stderr)
+            return 1
+
+        from mapper.architecture.fasm_generator import FasmGenerator
+
+        def _is_feature_conflict_errors(errors: list[str]) -> bool:
+            return any(err.startswith("Conflict: feature ") for err in errors)
+
+        def _attempt_fasm(mapping_result):
+            print(f"\nGenerating FASM: {args.fasm_output}")
+            args.fasm_output.parent.mkdir(parents=True, exist_ok=True)
+            effective = int(mapping_result.get("final_ii", mrrg.II))
+            expanded_out = args.fasm_output.with_suffix(".expanded_compiler_arch.json")
+            generated = fasm_gen.generate(
+                dfg=dfg,
+                placement=mapping_result["placement"],
+                routes=mapping_result["routes"],
+                route_metadata=mapping_result.get("route_metadata"),
+                output_path=str(args.fasm_output),
+                ii=effective,
+                expanded_compiler_arch_output_path=str(expanded_out),
+            )
+            if generated.expanded_compiler_arch_path:
+                print(
+                    "Expanded compiler_arch written to "
+                    f"{generated.expanded_compiler_arch_path}"
+                )
+            for warning in generated.warnings:
+                print(f"FASM warning: {warning}")
+            return generated, effective
+
+        fasm_gen = FasmGenerator(str(args.compiler_arch))
+        fasm_result, effective_ii = _attempt_fasm(result)
+
+        # If mapping is legal but FASM has switch-feature conflicts, continue II search
+        # and pick the minimum II where both mapping and FASM succeed.
+        if (
+            not fasm_result.ok
+            and _is_feature_conflict_errors(fasm_result.errors)
+            and effective_ii < args.max_ii
+        ):
+            next_ii = effective_ii + 1
+            print(
+                f"FASM conflicts at II={effective_ii}; retrying mapper from II={next_ii}..."
+            )
+            solved = False
+            for target_ii in range(next_ii, args.max_ii + 1):
+                candidate = _run_mapping(start_ii=target_ii, max_ii=target_ii)
+                if candidate["status"] != "success":
+                    continue
+                candidate_fasm, candidate_ii = _attempt_fasm(candidate)
+                if candidate_fasm.ok:
+                    result = candidate
+                    fasm_result = candidate_fasm
+                    effective_ii = candidate_ii
+                    solved = True
+                    break
+            if not solved and not fasm_result.ok:
+                print("error: FASM generation failed", file=sys.stderr)
+                for err in fasm_result.errors:
+                    print(f"  {err}", file=sys.stderr)
+                return 1
+
+        if not fasm_result.ok:
+            print("error: FASM generation failed", file=sys.stderr)
+            for err in fasm_result.errors:
+                print(f"  {err}", file=sys.stderr)
+            return 1
+        print(f"FASM written to {fasm_result.fasm_path}")
+        print(f"FASM assignments: {fasm_result.assignment_count}")
 
     # Save results if requested
     if args.output and result['status'] == 'success':
@@ -241,6 +330,7 @@ def cmd_map(args: argparse.Namespace) -> int:
             'status': result['status'],
             'placement': result['placement'],
             'routes': result['routes'],
+            'route_metadata': result.get('route_metadata'),
             'runtime': result['runtime'],
             'iterations': result['iterations'],
             'final_cost': result.get('final_cost', 0),
@@ -283,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
     p_map.add_argument("--placement-restart-patience", type=int, default=3, help="Placement retries before fresh restart")
     p_map.add_argument("--max-placement-restarts", type=int, default=4, help="Maximum fresh placement restarts per II")
     p_map.add_argument("--ii-iteration-patience", type=int, default=12, help="No-coverage-improvement placement iterations before escalating II")
+    p_map.add_argument("--fasm-output", type=Path, default=None, help="Output FASM file for successful mapping")
     p_map.add_argument("--seed", type=int, default=42, help="Random seed")
     p_map.add_argument("--debug", action="store_true", help="Enable debug output")
 

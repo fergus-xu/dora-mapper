@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from mapper.graph.mrrg import MRRGNode, OperandTag
@@ -29,6 +29,10 @@ class RoutingNodePlacementState:
     # Track number of sinks of each HyperVal using this node
     # Key: HyperVal, Value: count of sinks of that HyperVal using this node
     hyperval_usage: Dict[HyperVal, int] = field(default_factory=dict)
+
+    # Optional packed-lane ownership map.
+    # lane_index -> set of HyperVal source IDs currently using that lane.
+    packed_lane_usage: Dict[int, Set[str]] = field(default_factory=dict)
 
 
 @dataclass

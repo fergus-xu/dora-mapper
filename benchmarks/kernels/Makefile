@@ -42,6 +42,7 @@ RESULTS_LOG   := $(RESULTS_DIR)/results.log
 ARCH_NAME    := $(shell realpath -m --relative-to=$(ROOT)/benchmarks/architectures $(ARCH_DIR))
 ARCH_ID      := $(subst /,,$(ARCH_NAME))
 KERNEL_JSON  := $(RESULTS_DIR)/$(KERNEL)_$(ARCH_ID).json
+KERNEL_FASM  := $(RESULTS_DIR)/$(KERNEL)_$(ARCH_ID).fasm
 
 # ══════════════════════════════════════════════════════════
 .PHONY: map test clean help
@@ -76,6 +77,7 @@ $(KERNEL_JSON): $(DOT_FILE)
 		--max-iterations $(MAX_ITERATIONS) \
 		--max-ii $(MAX_II) \
 		--output $(KERNEL_JSON) \
+		--fasm-output $(KERNEL_FASM) \
 		| tee $(RESULTS_LOG) && \
 	(echo "" && echo "✓ Outputs written to $(RESULTS_DIR)/")
 

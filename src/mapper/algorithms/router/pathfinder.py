@@ -1,7 +1,7 @@
 """PathFrinder Algorithm for heuristic mapping."""
 
 import heapq
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Any, Dict, List, Set, Tuple, Optional
 
 from mapper.graph.dfg import DFG, DFGNode
 from mapper.graph.mrrg import MRRG, MRRGNode, NodeType, OperandTag
@@ -41,9 +41,10 @@ class PathFinder:
 
     # Routing solution
     _routing_solution: Dict[Tuple[HyperVal, int], List[MRRGNode]]
+    _route_profiles: Dict[Tuple[HyperVal, int], Dict[str, Any]]
 
     # Global map: routing node -> set of HyperVal IDs that currently use it
-    _global_routes: Dict[MRRGNode, Set[int]]
+    _global_routes: Dict[MRRGNode, Set[str]]
 
     # Dual use nodes
     _used_routing_fu_nodes: Set[MRRGNode]
@@ -66,6 +67,40 @@ class PathFinder:
     # Width mismatch cost: penalty per unit width ratio above 1.0.
     # Penalizes routing narrow data on wide routing links.
     WIDTH_MISMATCH_COST: float = 0.5
+
+    @staticmethod
+    def _strip_cycle_prefix(node_id: str) -> str:
+        """Convert '2:foo.bar' -> 'foo.bar'."""
+        if ":" in node_id:
+            return node_id.split(":", 1)[1]
+        return node_id
+
+    def _violates_sink_pin_binding(
+        self,
+        node: MRRGNode,
+        sink: MRRGNode,
+        tag_to_find: Optional[OperandTag],
+    ) -> bool:
+        """Return True when node conflicts with required sink operand pin.
+
+        For memory ops, prevent address operands from traversing sink `data_i*`
+        pins and prevent data operands from traversing sink `addr_i*` pins.
+        """
+        if tag_to_find not in (OperandTag.MEM_ADDR, OperandTag.MEM_DATA):
+            return False
+
+        node_bare = self._strip_cycle_prefix(node.id)
+        sink_bare = self._strip_cycle_prefix(sink.id)
+        sink_prefix = f"{sink_bare}."
+        if not node_bare.startswith(sink_prefix):
+            return False
+
+        lower_node = node_bare.lower()
+        if tag_to_find == OperandTag.MEM_ADDR and "data_i" in lower_node:
+            return True
+        if tag_to_find == OperandTag.MEM_DATA and "addr_i" in lower_node:
+            return True
+        return False
 
     def __init__(
         self,
@@ -143,6 +178,7 @@ class PathFinder:
 
         # Routing solution: (HyperVal, dest_idx) -> path of MRRG nodes
         self._routing_solution = {}
+        self._route_profiles = {}
 
         # Global HyperVal ownership per routing node
         self._global_routes = {}
@@ -166,6 +202,55 @@ class PathFinder:
             if state.historical_cost > 0.0:
                 history[node.id] = state.historical_cost
         return history
+
+    def get_route_metadata(self) -> Dict[Tuple[str, int], Dict[str, Any]]:
+        """Export route metadata in a CGRA-Solve-compatible shape.
+
+        This prepares router-side metadata plumbing for packed/fractured routing.
+        Current router behavior is flat, but we still emit a stable schema so
+        mixed-precision extensions can populate lane/fracture details later.
+        """
+        metadata: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for (hyperval, dest_idx), path in self._routing_solution.items():
+            path_ids = [node.id for node in path]
+            profile = self._route_profiles.get((hyperval, dest_idx), {})
+            lane_assignments = dict(profile.get("lane_assignments", {}))
+            active_pack_nodes = list(profile.get("active_pack_nodes", []))
+            active_unpack_nodes = list(profile.get("active_unpack_nodes", []))
+            lane_width = profile.get("lane_width")
+            transport_mode = str(profile.get("transport_mode", "flat"))
+            fractured = bool(profile.get("fractured", False))
+            chunk_indices = list(profile.get("chunk_indices", []))
+            chunk_widths = list(profile.get("chunk_widths", []))
+            chunk_offsets = list(profile.get("chunk_offsets", []))
+
+            total_bitwidth: Optional[int] = None
+            if (
+                hyperval.bitwidths
+                and dest_idx < len(hyperval.bitwidths)
+                and isinstance(hyperval.bitwidths[dest_idx], int)
+            ):
+                total_bitwidth = int(hyperval.bitwidths[dest_idx])
+
+            lane_index = profile.get("lane_index")
+
+            metadata[(hyperval.source_id, dest_idx)] = {
+                "paths": [path_ids],
+                "transport_mode": transport_mode,
+                "fractured": fractured,
+                "num_chunks": len(set(chunk_indices)) if chunk_indices else (1 if not fractured else 0),
+                "chunk_indices": sorted(set(chunk_indices)),
+                "chunk_widths": sorted(set(chunk_widths)),
+                "chunk_offsets": sorted(set(chunk_offsets)),
+                "lane_assignments": dict(lane_assignments),
+                "active_pack_nodes": sorted(set(active_pack_nodes)),
+                "active_unpack_nodes": sorted(set(active_unpack_nodes)),
+                "total_bitwidth": total_bitwidth,
+                "lane_width": lane_width,
+                "lane_index": lane_index,
+            }
+
+        return metadata
 
     def _compute_cycles_source_to_sink(
         self,
@@ -319,7 +404,12 @@ class PathFinder:
 
         return (uncovered, conflict_score, hyperval_info.fanout, hyperval_info.max_cycles)
 
-    def _commit_node(self, hyperval_net: Tuple[HyperVal, int], node: MRRGNode) -> None:
+    def _commit_node(
+        self,
+        hyperval_net: Tuple[HyperVal, int],
+        node: MRRGNode,
+        lane_index: Optional[int] = None,
+    ) -> None:
         """
         Commit a routing decision - add node to route.
 
@@ -360,6 +450,130 @@ class PathFinder:
             self._global_routes[node] = {hv_id}
         else:
             users.add(hv_id)
+
+        # Optional lane ownership for packed routes.
+        if lane_index is not None and getattr(node, "num_lanes", None):
+            lane_users = state.packed_lane_usage.setdefault(int(lane_index), set())
+            lane_users.add(hv_id)
+
+    def _allowed_lanes_for_node(self, node: MRRGNode) -> Set[int]:
+        """Return legal lane indices for a lane-capable node."""
+        num_lanes = getattr(node, "num_lanes", None)
+        if not isinstance(num_lanes, int) or num_lanes <= 1:
+            return set()
+        allowed = getattr(node, "allowed_lane_indices", None)
+        if isinstance(allowed, tuple) and allowed:
+            return {lane for lane in allowed if isinstance(lane, int)}
+        if isinstance(allowed, list) and allowed:
+            return {lane for lane in allowed if isinstance(lane, int)}
+        return set(range(num_lanes))
+
+    def _select_packed_lane(
+        self,
+        route: List[MRRGNode],
+        hyperval: HyperVal,
+    ) -> Optional[int]:
+        """Choose a common lane index for all lane-capable nodes in route."""
+        lane_nodes = [node for node in route if self._allowed_lanes_for_node(node)]
+        if not lane_nodes:
+            return None
+
+        common_lanes: Optional[Set[int]] = None
+        for node in lane_nodes:
+            allowed = self._allowed_lanes_for_node(node)
+            common_lanes = allowed if common_lanes is None else common_lanes & allowed
+            if not common_lanes:
+                return None
+
+        hv_id = hyperval.source_id
+        best_lane: Optional[int] = None
+        best_score: Optional[int] = None
+        for lane in sorted(common_lanes or set()):
+            score = 0
+            for node in lane_nodes:
+                state = self._routing_nodes.get(node)
+                if state is None:
+                    continue
+                lane_users = state.packed_lane_usage.get(lane, set())
+                # Prefer unused lanes, then lanes already used by same HyperVal.
+                if lane_users and hv_id not in lane_users:
+                    score += 1
+            if best_score is None or score < best_score:
+                best_lane = lane
+                best_score = score
+        return best_lane
+
+    def _build_transport_profile(
+        self,
+        route: List[MRRGNode],
+        hyperval: HyperVal,
+        required_bitwidth: Optional[int],
+    ) -> Dict[str, Any]:
+        """Construct per-route transport metadata for mixed precision."""
+        lane_index = self._select_packed_lane(route, hyperval)
+        lane_width_candidates = [
+            int(node.lane_width)
+            for node in route
+            if isinstance(getattr(node, "lane_width", None), int) and int(node.lane_width) > 0
+        ]
+        lane_width = min(lane_width_candidates) if lane_width_candidates else None
+
+        lane_assignments: Dict[str, int] = {}
+        if lane_index is not None:
+            for node in route:
+                if self._allowed_lanes_for_node(node):
+                    lane_assignments[node.id] = lane_index
+
+        pack_nodes = [node.id for node in route if bool(getattr(node, "pack_capable", False))]
+        unpack_nodes = [node.id for node in route if bool(getattr(node, "unpack_capable", False))]
+        active_pack_nodes = [pack_nodes[0]] if pack_nodes else []
+        active_unpack_nodes = [unpack_nodes[-1]] if unpack_nodes else []
+
+        fractured = False
+        chunk_indices = sorted(
+            {
+                int(node.fracture_chunk_index)
+                for node in route
+                if isinstance(getattr(node, "fracture_chunk_index", None), int)
+            }
+        )
+        chunk_widths = sorted(
+            {
+                int(node.fracture_chunk_width)
+                for node in route
+                if isinstance(getattr(node, "fracture_chunk_width", None), int)
+            }
+        )
+        chunk_offsets = sorted(
+            {
+                int(node.fracture_bit_offset)
+                for node in route
+                if isinstance(getattr(node, "fracture_bit_offset", None), int)
+            }
+        )
+        if chunk_indices or chunk_widths or chunk_offsets:
+            fractured = True
+
+        if lane_assignments and active_pack_nodes and active_unpack_nodes:
+            transport_mode = "packed"
+        elif fractured:
+            transport_mode = "fractured"
+        else:
+            transport_mode = "flat"
+
+        return {
+            "transport_mode": transport_mode,
+            "lane_index": lane_index,
+            "lane_width": lane_width,
+            "lane_assignments": lane_assignments,
+            "active_pack_nodes": active_pack_nodes,
+            "active_unpack_nodes": active_unpack_nodes,
+            "fractured": fractured,
+            "chunk_indices": chunk_indices,
+            "chunk_widths": chunk_widths,
+            "chunk_offsets": chunk_offsets,
+            "required_bitwidth": required_bitwidth,
+        }
 
     def _score_route(self, route: List[MRRGNode]) -> float:
         """
@@ -456,6 +670,8 @@ class PathFinder:
 
         route = self._routing_solution[hyperval_net]
         hyperval, _ = hyperval_net
+        profile = self._route_profiles.get(hyperval_net, {})
+        lane_index = profile.get("lane_index")
 
         # For each node in the route
         for node in route:
@@ -507,8 +723,17 @@ class PathFinder:
                 if node in self._global_routes:
                     del self._global_routes[node]
 
+            if lane_index is not None and isinstance(lane_index, int):
+                lane_users = state.packed_lane_usage.get(lane_index)
+                if lane_users is not None:
+                    lane_users.discard(hyperval.source_id)
+                    if not lane_users:
+                        del state.packed_lane_usage[lane_index]
+
         # Clear the routing
         del self._routing_solution[hyperval_net]
+        if hyperval_net in self._route_profiles:
+            del self._route_profiles[hyperval_net]
 
     def _rip_up_hyperval(self, hyperval: HyperVal) -> None:
         """
@@ -740,6 +965,9 @@ class PathFinder:
                 if fanout.node_type == NodeType.FUNCTION and fanout != sink:
                     continue
 
+                if self._violates_sink_pin_binding(fanout, sink, tag_to_find):
+                    continue
+
                 if fanout.node_type == NodeType.ROUTING_FUNCTION:
                     if fanout in self._used_routing_fu_nodes and fanout != sink:
                         continue
@@ -869,10 +1097,6 @@ class PathFinder:
 
         src_fu = self._placement[src_dfg_node]
         latency_of_src = src_fu.latency
-        required_bitwidth = None
-        if hyperval.bitwidths and hyperval.bitwidths[0]:
-            required_bitwidth = int(hyperval.bitwidths[0])
-
         # Get candidate fanouts of source FU (HyCUBE FUs can have multiple egress nets)
         fanout_edges = self._mrrg.get_outgoing_edges(src_fu.id)
         if not fanout_edges:
@@ -904,6 +1128,19 @@ class PathFinder:
                 # Create empty route for self-loop (no external routing needed)
                 hyperval_net = (hyperval, dest_idx)
                 self._routing_solution[hyperval_net] = []
+                self._route_profiles[hyperval_net] = {
+                    "transport_mode": "flat",
+                    "lane_index": None,
+                    "lane_width": None,
+                    "lane_assignments": {},
+                    "active_pack_nodes": [],
+                    "active_unpack_nodes": [],
+                    "fractured": False,
+                    "chunk_indices": [],
+                    "chunk_widths": [],
+                    "chunk_offsets": [],
+                    "required_bitwidth": None,
+                }
                 if self._debug:
                     print(f"  [SKIP] Self-loop detected for {hyperval.source_id} -> {dest_id} (loop-back edge)")
                 continue
@@ -939,7 +1176,7 @@ class PathFinder:
 
         # Hyperval-aware routing ownership:
         # routes[node] = set(hyperval_ids) of HyperVals that legitimately use this node
-        routes: Dict[MRRGNode, Set[int]] = {}
+        routes: Dict[MRRGNode, Set[str]] = {}
 
         # Store first-pass route for each sink
         sink_routes: Dict[int, List[MRRGNode]] = {}
@@ -949,6 +1186,14 @@ class PathFinder:
 
         # Route each sink in priority order
         for sink_info in sinks:
+            required_bitwidth = None
+            if (
+                hyperval.bitwidths
+                and sink_info.dest_idx < len(hyperval.bitwidths)
+                and hyperval.bitwidths[sink_info.dest_idx]
+            ):
+                required_bitwidth = int(hyperval.bitwidths[sink_info.dest_idx])
+
             # Try all immediate source fanouts, keep the shortest successful path.
             route: List[MRRGNode] = []
             best_score: Optional[float] = None
@@ -966,6 +1211,11 @@ class PathFinder:
                     latency_of_src=latency_of_src
                 )
                 if trial_route:
+                    trial_profile = self._build_transport_profile(
+                        trial_route,
+                        hyperval,
+                        required_bitwidth,
+                    )
                     trial_score = self._score_candidate_route(
                         root_fanout=root_fanout,
                         route=trial_route,
@@ -973,6 +1223,15 @@ class PathFinder:
                         required_bitwidth=required_bitwidth,
                         speculative_hv_nodes=set(routes.keys()),
                     )
+                    if (
+                        required_bitwidth is not None
+                        and src_fu.bitwidth > required_bitwidth
+                        and sink_info.sink_fu.bitwidth > required_bitwidth
+                    ):
+                        if trial_profile.get("transport_mode") == "packed":
+                            trial_score -= 0.25
+                        else:
+                            trial_score += 0.25
                     trial_len = len(trial_route)
                     if (
                         best_score is None
@@ -1026,10 +1285,23 @@ class PathFinder:
         for sink_info in sinks:
             hyperval_net = (hyperval, sink_info.dest_idx)
             route = sink_routes.get(sink_info.dest_idx, [])
+            required_bitwidth = None
+            if (
+                hyperval.bitwidths
+                and sink_info.dest_idx < len(hyperval.bitwidths)
+                and hyperval.bitwidths[sink_info.dest_idx]
+            ):
+                required_bitwidth = int(hyperval.bitwidths[sink_info.dest_idx])
+            profile = self._build_transport_profile(route, hyperval, required_bitwidth)
+            self._route_profiles[hyperval_net] = profile
 
             for node in route:
                 if node.node_type in (NodeType.ROUTING, NodeType.ROUTING_FUNCTION):
-                    self._commit_node(hyperval_net, node)
+                    self._commit_node(
+                        hyperval_net,
+                        node,
+                        lane_index=profile.get("lane_index"),
+                    )
 
         return True
 
@@ -1072,6 +1344,7 @@ class PathFinder:
         print("PATHFINDER ROUTING")
         print("="*60)
         print("\n[PHASE 1] Initial routing of all HyperVals...")
+        self._route_profiles = {}
 
         routed_all = True
         hypervals: List[HyperValNetInfo] = []

@@ -69,6 +69,21 @@ class MRRGNode(Node):
         bank_id: Optional[int] = None,
         read_ports: int = 1,
         write_ports: int = 1,
+        # Mixed-precision / packing metadata
+        lane_width: Optional[int] = None,
+        num_lanes: Optional[int] = None,
+        pack_capable: bool = False,
+        unpack_capable: bool = False,
+        allowed_lane_indices: Optional[Tuple[int, ...]] = None,
+        pack_config: Optional[Dict[str, Any]] = None,
+        unpack_config: Optional[Dict[str, Any]] = None,
+        fracture_type: Optional[str] = None,
+        fracture_parent_inst: Optional[str] = None,
+        fracture_chunk_width: Optional[int] = None,
+        fracture_parent_port: Optional[str] = None,
+        fracture_chunk_index: Optional[int] = None,
+        fracture_bit_offset: Optional[int] = None,
+        fracture_num_chunks: Optional[int] = None,
         **attributes: Any
     ) -> None:
         """
@@ -115,6 +130,22 @@ class MRRGNode(Node):
         self.bank_id = bank_id
         self.read_ports = read_ports
         self.write_ports = write_ports
+
+        # Mixed-precision / packing metadata (optional, architecture-dependent)
+        self.lane_width = lane_width
+        self.num_lanes = num_lanes
+        self.pack_capable = pack_capable
+        self.unpack_capable = unpack_capable
+        self.allowed_lane_indices = allowed_lane_indices
+        self.pack_config = pack_config
+        self.unpack_config = unpack_config
+        self.fracture_type = fracture_type
+        self.fracture_parent_inst = fracture_parent_inst
+        self.fracture_chunk_width = fracture_chunk_width
+        self.fracture_parent_port = fracture_parent_port
+        self.fracture_chunk_index = fracture_chunk_index
+        self.fracture_bit_offset = fracture_bit_offset
+        self.fracture_num_chunks = fracture_num_chunks
 
     def can_execute(self, operation: OperationType, required_bitwidth: Optional[int] = None) -> bool:
         """
@@ -1529,6 +1560,18 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
             # Create full node ID with time prefix: "cycle:base_id"
             # This is critical for the mapper's expectation of unique time-expanded IDs
             full_node_id = f"{time}:{node_id}"
+
+            node_attrs = node_data.get("extensions", {}).get("node_attrs", {})
+            packing = node_attrs.get("sub_word_packing", {})
+            fracture = node_attrs.get("fracture", {})
+
+            allowed_lane_indices = packing.get("allowed_lane_indices")
+            if isinstance(allowed_lane_indices, list):
+                allowed_lane_indices = tuple(
+                    lane for lane in allowed_lane_indices if isinstance(lane, int)
+                )
+            else:
+                allowed_lane_indices = None
             
             mrrg_node = MRRGNode(
                 node_id=full_node_id,
@@ -1542,7 +1585,21 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                 model=model,
                 datatype=datatype,
                 dora_kind=node_data.get("kind"),
-                dora_node_class=node_data.get("node_class")
+                dora_node_class=node_data.get("node_class"),
+                lane_width=packing.get("lane_width"),
+                num_lanes=packing.get("num_lanes"),
+                pack_capable=bool(packing.get("pack_capable", False)),
+                unpack_capable=bool(packing.get("unpack_capable", False)),
+                allowed_lane_indices=allowed_lane_indices,
+                pack_config=packing.get("pack_config"),
+                unpack_config=packing.get("unpack_config"),
+                fracture_type=fracture.get("type"),
+                fracture_parent_inst=fracture.get("parent_inst"),
+                fracture_chunk_width=fracture.get("chunk_width"),
+                fracture_parent_port=fracture.get("parent_port"),
+                fracture_chunk_index=fracture.get("chunk_index"),
+                fracture_bit_offset=fracture.get("bit_offset"),
+                fracture_num_chunks=fracture.get("num_chunks"),
             )
             
             mrrg.add_node(mrrg_node)
