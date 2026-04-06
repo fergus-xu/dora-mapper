@@ -1,7 +1,3 @@
-"""Architecture loading and representation for CGRA-ME integration."""
+"""Architecture helpers (compiler-arch/FASM/parsers)."""
 
-from mapper.architecture.architecture_loader import ArchitectureLoader
-
-__all__ = [
-    "ArchitectureLoader",
-]
+__all__: list[str] = []

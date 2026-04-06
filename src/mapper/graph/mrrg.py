@@ -69,6 +69,21 @@ class MRRGNode(Node):
         bank_id: Optional[int] = None,
         read_ports: int = 1,
         write_ports: int = 1,
+        # Mixed-precision / packing metadata
+        lane_width: Optional[int] = None,
+        num_lanes: Optional[int] = None,
+        pack_capable: bool = False,
+        unpack_capable: bool = False,
+        allowed_lane_indices: Optional[Tuple[int, ...]] = None,
+        pack_config: Optional[Dict[str, Any]] = None,
+        unpack_config: Optional[Dict[str, Any]] = None,
+        fracture_type: Optional[str] = None,
+        fracture_parent_inst: Optional[str] = None,
+        fracture_chunk_width: Optional[int] = None,
+        fracture_parent_port: Optional[str] = None,
+        fracture_chunk_index: Optional[int] = None,
+        fracture_bit_offset: Optional[int] = None,
+        fracture_num_chunks: Optional[int] = None,
         **attributes: Any
     ) -> None:
         """
@@ -115,6 +130,22 @@ class MRRGNode(Node):
         self.bank_id = bank_id
         self.read_ports = read_ports
         self.write_ports = write_ports
+
+        # Mixed-precision / packing metadata (optional, architecture-dependent)
+        self.lane_width = lane_width
+        self.num_lanes = num_lanes
+        self.pack_capable = pack_capable
+        self.unpack_capable = unpack_capable
+        self.allowed_lane_indices = allowed_lane_indices
+        self.pack_config = pack_config
+        self.unpack_config = unpack_config
+        self.fracture_type = fracture_type
+        self.fracture_parent_inst = fracture_parent_inst
+        self.fracture_chunk_width = fracture_chunk_width
+        self.fracture_parent_port = fracture_parent_port
+        self.fracture_chunk_index = fracture_chunk_index
+        self.fracture_bit_offset = fracture_bit_offset
+        self.fracture_num_chunks = fracture_num_chunks
 
     def can_execute(self, operation: OperationType, required_bitwidth: Optional[int] = None) -> bool:
         """
@@ -285,6 +316,7 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
         self.II = II
         self.rows = rows
         self.cols = cols
+        self.is_from_json = False
 
         # Cycle-indexed storage (CGRA-ME style)
         # nodes_by_cycle[cycle][base_name] -> MRRGNode
@@ -921,18 +953,78 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
         return path_map
 
     def time_expand(self, new_ii: int) -> 'MRRG':
-        """
-        Create a time-expanded version of this MRRG.
-        
-        This expands the II=1 base MRRG to a new II by creating nodes for each cycle
-        and wiring them according to the CGRA-ME formulation.
+        """Time-expand the graph to a new Initiation Interval."""
+        # Create a new MRRG with updated II
+        expanded = MRRG(name=f"{self.name}_expanded", II=new_ii, rows=self.rows, cols=self.cols)
+        expanded.is_from_json = self.is_from_json
 
-        Args:
-            new_ii: The new Initiation Interval (II) to expand to.
+        # If loaded from JSON (Dora), use generic duplication instead of smart renaming
+        if self.is_from_json:
+            import copy
+            # 1. Duplicate all nodes across cycles
+            processed_bases = set()
+            for node in self.get_nodes():
+                # Extract base ID (remove cycle prefix if it exists)
+                base_id = node.id.split(':', 1)[1] if ':' in node.id else node.id
+                if base_id in processed_bases:
+                    continue
+                processed_bases.add(base_id)
+                
+                for cycle in range(new_ii):
+                    new_id = f"{cycle}:{base_id}"
+                    new_node = MRRGNode(
+                        node_id=new_id,
+                        node_type=node.node_type,
+                        cycle=cycle,
+                        coordinates=node.coordinates,
+                        hw_entity_type=node.hw_entity_type,
+                        latency=node.latency,
+                        bitwidth=node.bitwidth,
+                        supported_operations=node.supported_operations.copy()
+                    )
+                    # Copy extra attributes if they exist
+                    for attr in ['routing_type', 'bank_id', 'read_ports', 'write_ports']:
+                        if hasattr(node, attr):
+                            setattr(new_node, attr, getattr(node, attr))
+                    expanded.add_node(new_node)
+            
+            # 2. Duplicate all edges across cycles
+            processed_edges = set()
+            for edge in self.get_edges():
+                src_base = edge.source.id.split(':', 1)[1] if ':' in edge.source.id else edge.source.id
+                dst_base = edge.destination.id.split(':', 1)[1] if ':' in edge.destination.id else edge.destination.id
+                
+                # Dora MRRGs often encode pipeline delay on nodes (e.g., registers/LSUs)
+                # while edge time deltas are all 0 in II=1.
+                # Preserve cycle reachability by advancing destination cycle by node latency
+                # when edge latency is not explicitly positive.
+                effective_latency = edge.latency if edge.latency > 0 else max(0, edge.source.latency)
 
-        Returns:
-            A new MRRG instance expanded to the specified II.
-        """
+                edge_key = (src_base, dst_base, effective_latency)
+                if edge_key in processed_edges:
+                    continue
+                processed_edges.add(edge_key)
+                
+                for cycle in range(new_ii):
+                    # Edge latency determines the cycle jump (modulo scheduled)
+                    dst_cycle = (cycle + effective_latency) % new_ii
+                    
+                    src_new = f"{cycle}:{src_base}"
+                    dst_new = f"{dst_cycle}:{dst_base}"
+                    
+                    if expanded.has_node(src_new) and expanded.has_node(dst_new):
+                        new_edge = MRRGEdge(
+                            edge_id=f"{src_new}_to_{dst_new}",
+                            source=expanded.get_node(src_new),
+                            destination=expanded.get_node(dst_new),
+                            latency=effective_latency
+                        )
+                        new_edge.capacity = edge.capacity
+                        expanded.add_edge(new_edge)
+                        
+            return expanded
+
+        # --- Legacy 'Smart' Expansion ---
         if new_ii <= 0:
             raise ValueError(f"Invalid II: {new_ii}")
 
@@ -1207,38 +1299,134 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
         import json
         import re
 
+        # -- Op Code Mapping between Dora Architecture and Mapper IR -----------------
+        # Maps Dora architecture "optype" to the mapper's internal OperationType
+        DORA_OPTYPE_MAP = {
+            "ADD": OperationType.ADD,
+            "SUB": OperationType.SUB,
+            "MUL": OperationType.MUL,
+            "DIV": OperationType.DIV,
+            "AND": OperationType.AND,
+            "OR": OperationType.OR,
+            "XOR": OperationType.XOR,
+            "LSL": OperationType.SHL,
+            "LSR": OperationType.LSHR,
+            "ASR": OperationType.ASHR,
+            "LD": OperationType.LOAD,
+            "ST": OperationType.STORE,
+            "ICMP": OperationType.ICMP,
+            "SELECT": OperationType.SELECT,
+            "PHI": OperationType.PHI,
+            "INPUT": OperationType.INPUT,
+            "OUTPUT": OperationType.OUTPUT,
+            "CONST": OperationType.CONST,
+            "NOP": OperationType.NOP,
+            # Handle mixed case if needed
+            "add": OperationType.ADD,
+            "sub": OperationType.SUB,
+            "mul": OperationType.MUL,
+            "div": OperationType.DIV,
+            "and": OperationType.AND,
+            "or": OperationType.OR,
+            "xor": OperationType.XOR,
+            "lsl": OperationType.SHL,
+            "lsr": OperationType.LSHR,
+            "asr": OperationType.ASHR,
+            "ld": OperationType.LOAD,
+            "st": OperationType.STORE,
+            "icmp": OperationType.ICMP,
+            "select": OperationType.SELECT,
+            "phi": OperationType.PHI,
+            "input": OperationType.INPUT,
+            "output": OperationType.OUTPUT,
+            "const": OperationType.CONST,
+            "nop": OperationType.NOP,
+        }
+
+        DORA_OP_ALIASES = {
+            "LOAD": "LD",
+            "STORE": "ST",
+            "SHL": "LSL",
+            "SHR": "LSR",
+            "SAR": "ASR",
+            "CMP": "ICMP",
+        }
+
+        def map_dora_operation(optype: str, operation_id: str = "") -> Optional[OperationType]:
+            """Map Dora operation strings to mapper OperationType with aliases/fallbacks."""
+            if not optype:
+                optype = ""
+
+            # Fast path: existing direct map (supports mixed case keys already).
+            if optype in DORA_OPTYPE_MAP:
+                return DORA_OPTYPE_MAP[optype]
+
+            norm = optype.strip().upper()
+            if norm in DORA_OP_ALIASES:
+                norm = DORA_OP_ALIASES[norm]
+
+            if norm in DORA_OPTYPE_MAP:
+                return DORA_OPTYPE_MAP[norm]
+
+            # Enum-name fallback
+            try:
+                return OperationType[norm]
+            except (KeyError, ValueError):
+                pass
+
+            # Enum-value fallback
+            for op_enum in OperationType:
+                if op_enum.value.lower() == norm.lower():
+                    return op_enum
+
+            # Last-resort fallback from operation_id tokens (e.g., hycube.mem.load.i32)
+            if operation_id:
+                for token in operation_id.replace('-', '.').split('.'):
+                    token_norm = token.strip().upper()
+                    if not token_norm:
+                        continue
+                    if token_norm in DORA_OP_ALIASES:
+                        token_norm = DORA_OP_ALIASES[token_norm]
+                    if token_norm in DORA_OPTYPE_MAP:
+                        return DORA_OPTYPE_MAP[token_norm]
+                    try:
+                        return OperationType[token_norm]
+                    except (KeyError, ValueError):
+                        continue
+
+            return None
+
         # Load JSON file
         with open(json_file_path, 'r') as f:
             data = json.load(f)
 
         # Load compiler_arch.json if provided
-        module_operations_map = {}  # module_name -> Set[OperationType]
+        # module_name -> Set[OperationType]
+        module_operations_map: Dict[str, Set[OperationType]] = {}
+        
         if compiler_arch_path:
             with open(compiler_arch_path, 'r') as f:
                 compiler_arch = json.load(f)
             
-            # Parse module_operation_capabilities
+            # Parse module_operation_capabilities (Dora Version)
+            # The new structure has module_name and a list of bindings, 
+            # where each binding has an "optype" string.
             capabilities = compiler_arch.get("module_operation_capabilities", [])
             for cap in capabilities:
                 module_name = cap.get("module_name")
-                operations = cap.get("operations", [])
+                bindings = cap.get("bindings", [])
                 
-                if module_name and operations:
-                    # Convert operation strings to OperationType
+                if module_name and bindings:
                     op_set = set()
-                    for op_str in operations:
-                        try:
-                            # Try to find matching OperationType
-                            op_type = OperationType[op_str.upper()]
-                            op_set.add(op_type)
-                        except KeyError:
-                            # If exact match fails, try lowercase value match
-                            for op_enum in OperationType:
-                                if op_enum.value.lower() == op_str.lower():
-                                    op_set.add(op_enum)
-                                    break
+                    for binding in bindings:
+                        op_str = binding.get("optype", "")
+                        operation_id = binding.get("operation_id", "")
+                        mapped_op = map_dora_operation(op_str, operation_id)
+                        if mapped_op is not None:
+                            op_set.add(mapped_op)
                     
-                    module_operations_map[module_name] = op_set
+                    if op_set:
+                        module_operations_map[module_name] = op_set
 
         # Extract nodes and edges
         nodes_data = data.get("nodes", [])
@@ -1250,89 +1438,141 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
 
         # Create MRRG instance
         mrrg = cls(name=name, II=II)
+        mrrg.is_from_json = True
 
-        # Helper to determine node type
-        def get_node_type(kind: str, node_id: str, model: Optional[str]) -> NodeType:
-            """Map JSON 'kind' to NodeType."""
-            if kind == "instance":
-                # known routing block instances in dice
-                n = node_id.lower()
-                if "xbar" in n or "sb" in n or "reg" in n:
-                    return NodeType.ROUTING
-                return NodeType.FUNCTION
-            return NodeType.ROUTING
-
-        # Helper to determine HW entity type
-        def get_hw_entity_type(kind: str, node_id: str, model: Optional[str]) -> HWEntityType:
-            """Map JSON fields to HWEntityType."""
-            n = node_id.lower()
-            if kind == "instance":
-                if "reg" in n:
-                    return HWEntityType.HW_REG
-                elif "mux" in n or "xbar" in n or "sb" in n:
-                    return HWEntityType.HW_MUX
-                return HWEntityType.HW_COMB
-            return HWEntityType.HW_WIRE
-
-        # Helper to parse coordinates
-        def parse_coordinates(node_id: str) -> Optional[Tuple[int, int]]:
-            """Extract (x, y) from node_id like 'pe_X_Y' or 'sb_X_Y'."""
-            match = re.search(r'(?:pe|sb|fu|reg)_(\d+)_(\d+)', node_id)
-            if match:
-                return (int(match.group(1)), int(match.group(2)))
-            return None
-
-        # Helper to determine bitwidth
-        def get_bitwidth(datatype: Optional[str]) -> int:
-            """Extract bitwidth from datatype string."""
-            if datatype and "float32" in datatype:
-                return 32
-            elif datatype and "float64" in datatype:
-                return 64
-            return 32
-
-        # Helper to get supported operations from compiler_arch
-        def get_supported_operations(model: Optional[str]) -> Set[OperationType]:
-            """Get supported operations from compiler_arch module_operation_capabilities."""
-            if not model or not module_operations_map:
-                return set()
+        # Helper to classify nodes from Dora properties
+        def classify_node(node_data: Dict[str, Any]) -> Tuple[NodeType, HWEntityType, Optional[Tuple[int, int]]]:
+            """Determine NodeType and HWEntityType from Dora JSON fields."""
+            kind = node_data.get("kind", "net")
+            node_class = node_data.get("node_class", "routing")
+            model = node_data.get("model", "")
             
-            # Try exact match first
-            if model in module_operations_map:
-                return module_operations_map[model]
-            
-            # Try partial match (e.g., "cvfpu_fpu_inst" should match "cvfpu_fpu")
-            for module_name, ops in module_operations_map.items():
-                if module_name in model or model in module_name:
-                    return ops
-            
-            return set()
+            # Determine mapping position (global_coordinates)
+            # Dora uses [x, y] list or null
+            coords = node_data.get("global_coordinates")
+            coordinates = None
+            if isinstance(coords, list) and len(coords) >= 2:
+                coordinates = (coords[0], coords[1])
+            elif not coords and "node_id" in node_data:
+                # Fallback to name parsing if coordinates are missing (unlikely in Dora, but safe)
+                coordinates = mrrg._parse_coordinates_from_name(node_data["node_id"], add_edge_offset=False)
 
+            # Assign types based on node_class and kind
+            if node_class in ("functional_unit", "alu", "io"):
+                return NodeType.FUNCTION, HWEntityType.HW_COMB, coordinates
+            elif node_class == "register":
+                return NodeType.ROUTING, HWEntityType.HW_REG, coordinates
+            elif node_class == "routing" or kind == "net":
+                # Check for multiplexers in models or names
+                if model and ("mux" in model.lower() or "xbar" in model.lower()):
+                    return NodeType.ROUTING, HWEntityType.HW_MUX, coordinates
+                return NodeType.ROUTING, HWEntityType.HW_WIRE, coordinates
+                
+            return NodeType.ROUTING, HWEntityType.HW_UNSPECIFIED, coordinates
+
+        # Use a map to track nodes by their raw IDs for edge connection
+        node_map: Dict[str, MRRGNode] = {}
+        
         # Create nodes
-        node_map = {}
         for node_data in nodes_data:
             node_id = node_data["node_id"]
             time = node_data.get("time", 0)
-            kind = node_data.get("kind", "net")
             datatype = node_data.get("datatype")
             model = node_data.get("model")
             
-            # Determine properties
-            node_type = get_node_type(kind, node_id, model)
-            hw_entity_type = get_hw_entity_type(kind, node_id, model)
-            coordinates = parse_coordinates(node_id)
-            bitwidth = get_bitwidth(datatype)
-            latency = 1 if hw_entity_type == HWEntityType.HW_REG else 0
+            # Use explicit classification
+            node_type, hw_entity_type, coordinates = classify_node(node_data)
             
-            # For FU nodes, extract supported operations from compiler_arch
+            # Bitwidth detection
+            bitwidth = node_data.get("bitwidth")
+            if bitwidth is None:
+                # Fallback to datatype parsing
+                if datatype and "int" in datatype:
+                    match = re.search(r'int(\d+)', datatype)
+                    bitwidth = int(match.group(1)) if match else 32
+                else:
+                    bitwidth = 32
+            
+            # Check explicit "operations" field first (new Dora feature)
+            json_ops = node_data.get("operations", [])
+
+            # Latency detection:
+            # 1) explicit top-level node latency
+            # 2) per-operation scheduling latency in Dora API
+            # 3) sane default (registers=1, others=0)
+            latency = node_data.get("latency")
+            if latency is None:
+                latency = 0
+
+            if latency == 0 and json_ops:
+                sched_lats = []
+                for op_entry in json_ops:
+                    scheduling = op_entry.get("scheduling", {})
+                    lat_cycles = scheduling.get("latency_cycles")
+                    if isinstance(lat_cycles, int):
+                        sched_lats.append(lat_cycles)
+                if sched_lats:
+                    # Be conservative for timing correctness.
+                    latency = max(sched_lats)
+
+            if latency == 0 and hw_entity_type == HWEntityType.HW_REG:
+                latency = 1 # Default for registers if unspecified
+            
+            # Gather supported operations
             supported_operations = set()
+            
+            for op_entry in json_ops:
+                op_str = op_entry.get("optype", "")
+                operation_id = op_entry.get("operation_id", "")
+                mapped_op = map_dora_operation(op_str, operation_id)
+                if mapped_op is not None:
+                    supported_operations.add(mapped_op)
+            
+            # If no explicit ops, fall back to module_operations_map from compiler_arch
+            if not supported_operations and model:
+                if model in module_operations_map:
+                    supported_operations = module_operations_map[model]
+                else:
+                    # Partial match for module variants (e.g., hycube_alu_32b)
+                    for m_name, ops in module_operations_map.items():
+                        if m_name in model or model in m_name:
+                            supported_operations = ops
+                            break
+
+            # Compatibility shim:
+            # DFGs often retain PHI/SELECT pseudo-ops even when HyCUBE API does not
+            # list them explicitly. Restrict this augmentation to ALU-like compute units
+            # only, instead of the previous blanket add-to-all-function-units behavior.
             if node_type == NodeType.FUNCTION:
-                supported_operations = get_supported_operations(model)
+                model_l = (model or "").lower()
+                node_class_l = str(node_data.get("node_class", "")).lower()
+                is_alu_like = (
+                    ("alu" in model_l)
+                    or (
+                        node_class_l == "functional_unit"
+                        and not any(tok in model_l for tok in ("const", "lsu", "mem", "iopad", "io"))
+                    )
+                )
+                if is_alu_like:
+                    supported_operations.add(OperationType.PHI)
+                    supported_operations.add(OperationType.SELECT)
             
-            # Create full node ID with time prefix
+            # Create full node ID with time prefix: "cycle:base_id"
+            # This is critical for the mapper's expectation of unique time-expanded IDs
             full_node_id = f"{time}:{node_id}"
+
+            node_attrs = node_data.get("extensions", {}).get("node_attrs", {})
+            packing = node_attrs.get("sub_word_packing", {})
+            fracture = node_attrs.get("fracture", {})
+
+            allowed_lane_indices = packing.get("allowed_lane_indices")
+            if isinstance(allowed_lane_indices, list):
+                allowed_lane_indices = tuple(
+                    lane for lane in allowed_lane_indices if isinstance(lane, int)
+                )
+            else:
+                allowed_lane_indices = None
             
-            # Create MRRGNode
             mrrg_node = MRRGNode(
                 node_id=full_node_id,
                 node_type=node_type,
@@ -1341,27 +1581,56 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                 hw_entity_type=hw_entity_type,
                 latency=latency,
                 bitwidth=bitwidth,
-                supported_operations=supported_operations
+                supported_operations=supported_operations,
+                model=model,
+                datatype=datatype,
+                dora_kind=node_data.get("kind"),
+                dora_node_class=node_data.get("node_class"),
+                lane_width=packing.get("lane_width"),
+                num_lanes=packing.get("num_lanes"),
+                pack_capable=bool(packing.get("pack_capable", False)),
+                unpack_capable=bool(packing.get("unpack_capable", False)),
+                allowed_lane_indices=allowed_lane_indices,
+                pack_config=packing.get("pack_config"),
+                unpack_config=packing.get("unpack_config"),
+                fracture_type=fracture.get("type"),
+                fracture_parent_inst=fracture.get("parent_inst"),
+                fracture_chunk_width=fracture.get("chunk_width"),
+                fracture_parent_port=fracture.get("parent_port"),
+                fracture_chunk_index=fracture.get("chunk_index"),
+                fracture_bit_offset=fracture.get("bit_offset"),
+                fracture_num_chunks=fracture.get("num_chunks"),
             )
             
             mrrg.add_node(mrrg_node)
-            node_map[node_id] = mrrg_node
+            # Map by original node_id (the one encountered in the edges section of the JSON)
+            node_map[f"{time}:{node_id}"] = mrrg_node
 
         # Create edges
         for edge_data in edges_data:
-            src_id = edge_data["source_node"]
-            src_time = edge_data.get("source_time", 0)
-            dst_id = edge_data["target_node"]
-            dst_time = edge_data.get("target_time", 0)
+            # Dora MRRG JSON uses relative or unrolled edge definitions
+            src_id = edge_data.get("source_node")
+            src_time = edge_data.get("source_time", edge_data.get("time", 0))
+            dst_id = edge_data.get("target_node")
+            dst_time = edge_data.get("target_time", edge_data.get("time", 0))
             
-            src_node = node_map.get(src_id)
-            dst_node = node_map.get(dst_id)
+            # Build keys using the same pattern as full_node_id
+            # Using modulo II ensures that cross-cycle edges in unrolled descriptions 
+            # connect back to the base node version for the mapper's expansion.
+            src_key = f"{src_time % II}:{src_id}"
+            dst_key = f"{dst_time % II}:{dst_id}"
+            
+            src_node = node_map.get(src_key)
+            dst_node = node_map.get(dst_key)
             
             if src_node and dst_node:
-                # Calculate edge latency from time difference
-                edge_latency = 0
-                if dst_time != src_time:
+                # Calculate latency from time difference
+                # For base architectures (II=1), the direct difference is the latency.
+                # For modulo architectures (II>1), we use the modulo difference.
+                if II > 1:
                     edge_latency = (dst_time - src_time) % II
+                else:
+                    edge_latency = dst_time - src_time
                 
                 edge_id = f"{src_node.id}_to_{dst_node.id}"
                 
@@ -1372,9 +1641,13 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                     latency=edge_latency
                 )
                 
+                # Check for capacity or other attributes
+                if "capacity" in edge_data:
+                    mrrg_edge.capacity = edge_data["capacity"]
+                
                 mrrg.add_edge(mrrg_edge)
 
-        # Update array dimensions
+        # Finalize array dimensions from coordinates
         if mrrg.get_nodes():
             max_x = max_y = 0
             for node in mrrg.get_nodes():

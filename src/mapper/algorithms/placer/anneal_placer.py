@@ -34,7 +34,7 @@ class AnnealPlacer:
     _temporal_op_type_to_fu_nodes: Dict[Tuple[OperationType, int], List[MRRGNode]]
 
     # User reserved MRRG nodes
-    _reserved_fu_nodes: Set[MRRGNode]
+    _reserved_fu_nodes: Set[str]
 
     # User reserved map from DFG node id to MRRG node id
     _reserved_dfg_node_id_to_fu_node_id: Dict[str, str]
@@ -68,6 +68,10 @@ class AnnealPlacer:
         # Shwet TODO: Do we want to generate a random seed here or make this user driven?
         self._random_seed = random_seed
         self._swap_factor = swap_factor
+        self._acceptance_rate = 0.0
+
+        # Deterministic behavior across runs when a seed is provided.
+        random.seed(self._random_seed)
 
         # Initialize state dictionaries
         self._fu_node_placement_state = {}
@@ -81,12 +85,11 @@ class AnnealPlacer:
 
         # Initialize the fixed placements
         for dfg_node_id, mrrg_node_id in fixed_placement:
-
-            if mrrg_node_id not in self._fu_node_placement_state:
+            if not mrrg.has_node(mrrg_node_id):
                 raise ValueError(f"MRRG node {mrrg_node_id} not found in the MRRG")
             
             fu_node = mrrg.get_node(mrrg_node_id)
-            self._reserved_fu_nodes.add(fu_node)
+            self._reserved_fu_nodes.add(fu_node.id)
             self._reserved_dfg_node_id_to_fu_node_id[dfg_node_id] = fu_node.id
 
         # Initialize FU node states to zero
@@ -110,13 +113,15 @@ class AnnealPlacer:
 
                 self._temporal_op_type_to_fu_nodes[(op.operation, i)] = fu_nodes
 
-    def anneal(self, initial_temperature: float) -> None:
-        """Anneal the placement."""
+    def anneal(self, initial_temperature: float) -> float:
+        """Anneal the placement and return final acceptance rate."""
         temperature: float = initial_temperature
+        accept_rate: float = 0.0
 
         while True:
             # Inner loop: perform swaps at current temperature
-            accept_rate: float = self.inner_loop(temperature)
+            accept_rate = self.inner_loop(temperature)
+            self._acceptance_rate = accept_rate
             
             # Check termination
             current_cost: float = self.get_total_cost()
@@ -128,6 +133,7 @@ class AnnealPlacer:
                 break
 
             temperature = self.next_temperature(temperature, accept_rate)
+        return accept_rate
 
     def update_op_placement(self, op: DFGNode, fu_node: MRRGNode) -> None:
         """Update the placement state and mapfor the given operation and FU node."""
@@ -145,6 +151,68 @@ class AnnealPlacer:
             if op.id in self._reserved_dfg_node_id_to_fu_node_id:
                 continue
             self.update_op_placement(op, self.get_random_unoccupied_fu(op))
+
+    def set_initial_placement_with_history(
+        self,
+        dfg_to_fu_hints: Optional[Dict[str, str]] = None,
+        fu_penalties: Optional[Dict[str, float]] = None,
+        explore_probability: float = 0.2,
+    ) -> None:
+        """
+        Set initial placement guided by prior iterations.
+
+        Args:
+            dfg_to_fu_hints: Preferred FU per DFG node from prior attempts.
+            fu_penalties: Per-FU congestion penalties learned from routing.
+            explore_probability: Chance to ignore history and explore randomly.
+        """
+        dfg_to_fu_hints = dfg_to_fu_hints or {}
+        fu_penalties = fu_penalties or {}
+        explore_probability = max(0.0, min(1.0, explore_probability))
+
+        for op in self._dfg.get_nodes():
+            if op.id in self._reserved_dfg_node_id_to_fu_node_id:
+                continue
+
+            candidates = self._get_unoccupied_candidates(op)
+            if not candidates:
+                self.update_op_placement(op, self.get_random_unoccupied_fu(op))
+                continue
+
+            if random.random() < explore_probability:
+                self.update_op_placement(op, random.choice(candidates))
+                continue
+
+            preferred_fu_id = dfg_to_fu_hints.get(op.id)
+            best_fu = None
+            best_score = float("inf")
+            for fu in candidates:
+                score = fu_penalties.get(fu.id, 0.0)
+                if preferred_fu_id is None or fu.id != preferred_fu_id:
+                    score += 1.0
+                if score < best_score:
+                    best_score = score
+                    best_fu = fu
+
+            self.update_op_placement(op, best_fu if best_fu is not None else random.choice(candidates))
+
+    def _get_unoccupied_candidates(self, op: DFGNode) -> List[MRRGNode]:
+        """Get all unoccupied, non-reserved FU candidates across II cycles."""
+        preferred_cycle: int = op.asap_time % self._ii
+        cycles_to_try = [preferred_cycle] + [c for c in range(self._ii) if c != preferred_cycle]
+        unoccupied_fu_nodes: List[MRRGNode] = []
+
+        for cycle in cycles_to_try:
+            key = (op.operation, cycle)
+            if key not in self._temporal_op_type_to_fu_nodes:
+                continue
+            for fu_node in self._temporal_op_type_to_fu_nodes[key]:
+                if fu_node.id in self._reserved_fu_nodes:
+                    continue
+                if self._fu_node_placement_state[fu_node].occupancy < fu_node.capacity:
+                    unoccupied_fu_nodes.append(fu_node)
+
+        return unoccupied_fu_nodes
 
     def get_random_fu(self, op: DFGNode) -> MRRGNode:
         """Get a random FU node that can execute the given operation, which may be occupied or not."""
@@ -332,8 +400,7 @@ class AnnealPlacer:
 
             # Accept or reject the move
             if self.accept_move(delta_cost, temperature):
-                if delta_cost > 0:
-                    total_accepted += 1
+                total_accepted += 1
             else:
                 # Restore old placement
                 for dfg_op, fu_node in old_placement.items():

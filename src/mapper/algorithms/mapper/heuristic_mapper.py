@@ -47,9 +47,13 @@ class HeuristicMapper:
         convergence_threshold: float = 0.01,
         random_seed: int = 42,
         swap_factor: int = 10,
-        router_max_iterations: int = 70,
+        router_max_iterations: int = 30,
+        bitwidth_mismatch_penalty_weight: float = 0.5,
         p_growth_rate: float = 1.5,
         h_growth_rate: float = 1.5,
+        placement_restart_patience: int = 3,
+        max_placement_restarts: int = 4,
+        ii_iteration_patience: int = 12,
         debug: bool = False,
     ):
         """
@@ -67,12 +71,20 @@ class HeuristicMapper:
             random_seed: Random seed for reproducibility
             swap_factor: Number of swaps per temperature (num_ops * swap_factor)
             router_max_iterations: Max iterations for PathFinder routing
+            bitwidth_mismatch_penalty_weight: Soft routing cost penalty for
+                                             using wider-than-required NoC links
             p_growth_rate: PathFinder present congestion growth rate
             h_growth_rate: PathFinder history congestion growth rate
+            placement_restart_patience: Failed/no-improvement routing iterations
+                                      before trying a fresh placement
+            max_placement_restarts: Maximum fresh placement retries per II
+            ii_iteration_patience: If no routing coverage improvement for this
+                                  many placement iterations, move to next II
             debug: Enable debug output
         """
         self._dfg = dfg
         self._mrrg = mrrg
+        self._base_mrrg = mrrg
         self._latency_spec = latency_spec
         self._initial_temperature = initial_temperature
         self._max_iterations = max_iterations
@@ -82,16 +94,25 @@ class HeuristicMapper:
         self._random_seed = random_seed
         self._swap_factor = swap_factor
         self._router_max_iterations = router_max_iterations
+        self._bitwidth_mismatch_penalty_weight = bitwidth_mismatch_penalty_weight
         self._p_growth_rate = p_growth_rate
         self._h_growth_rate = h_growth_rate
+        self._placement_restart_patience = max(1, placement_restart_patience)
+        self._max_placement_restarts = max(0, max_placement_restarts)
+        self._ii_iteration_patience = max(1, ii_iteration_patience)
         self._debug = debug
 
         # Results
         self._placement: Optional[Dict[DFGNode, MRRGNode]] = None
         self._routing_solution = None
+        self._route_metadata: Optional[Dict[Tuple[str, int], Dict[str, Any]]] = None
         self._iterations_run = 0
         self._final_cost = 0.0
         self._timed_out = False
+        self._history_ii: Optional[int] = None
+        self._routing_history_costs: Dict[str, float] = {}
+        self._fu_failure_penalties: Dict[str, float] = {}
+        self._best_placement_hint: Dict[str, str] = {}
 
     def _calculate_min_ii(self) -> int:
         """Calculate the theoretical minimum II based on resource constraints."""
@@ -122,6 +143,11 @@ class HeuristicMapper:
     def _map_with_ii(self) -> Dict[str, Any]:
         """Run the mapping flow for the current MRRG's II."""
         start_time = time.time()
+        if self._history_ii != self._mrrg.II:
+            self._history_ii = self._mrrg.II
+            self._routing_history_costs.clear()
+            self._fu_failure_penalties.clear()
+            self._best_placement_hint.clear()
         
         # Phase 1: ASAP Scheduling
         if self._debug:
@@ -133,6 +159,7 @@ class HeuristicMapper:
                 'status': 'failed',
                 'placement': None,
                 'routes': None,
+                'route_metadata': None,
                 'runtime': time.time() - start_time,
                 'iterations': 0,
                 'final_cost': 0.0,
@@ -155,6 +182,7 @@ class HeuristicMapper:
                 'status': 'success',
                 'placement': placement_dict,
                 'routes': routing_dict,
+                'route_metadata': self._route_metadata,
                 'runtime': runtime,
                 'iterations': self._iterations_run,
                 'final_cost': self._final_cost,
@@ -173,13 +201,14 @@ class HeuristicMapper:
                 'status': 'failed',
                 'placement': None,
                 'routes': None,
+                'route_metadata': None,
                 'runtime': runtime,
                 'iterations': self._iterations_run,
                 'final_cost': self._final_cost,
                 'error_message': error_msg
             }
 
-    def map(self, max_ii: int = 4) -> Dict[str, Any]:
+    def map(self, max_ii: int = 32) -> Dict[str, Any]:
         """
         Run the heuristic mapping flow with automatic II escalation.
         
@@ -198,13 +227,16 @@ class HeuristicMapper:
         if self._debug:
             print(f"\nTheoretical minimum II: {min_ii}")
             
-        # Time expand MRRG if starting II > 1
-        if current_ii > self._mrrg.II:
+        # Time expand MRRG if starting II > 1.
+        # Always expand from the original base MRRG to avoid compounding
+        # expansion artifacts across II attempts.
+        if current_ii > self._base_mrrg.II:
             if self._debug:
                 print(f"Time-expanding MRRG to starting II={current_ii}...")
-            self._mrrg = self._mrrg.time_expand(current_ii)
-            
-        original_mrrg = self._mrrg
+            self._mrrg = self._base_mrrg.time_expand(current_ii)
+        else:
+            self._mrrg = self._base_mrrg
+
         total_iterations = 0
             
         while current_ii <= max_ii:
@@ -236,7 +268,7 @@ class HeuristicMapper:
             if current_ii <= max_ii:
                 if self._debug:
                     print(f"\nTime-expanding MRRG from II={current_ii-1} to II={current_ii}...")
-                self._mrrg = original_mrrg.time_expand(current_ii)
+                self._mrrg = self._base_mrrg.time_expand(current_ii)
                 self._timed_out = False
                 
         # Failed to map even at max_ii
@@ -244,6 +276,7 @@ class HeuristicMapper:
             'status': 'failed',
             'placement': None,
             'routes': None,
+            'route_metadata': None,
             'runtime': time.time() - start_time,
             'iterations': total_iterations,
             'final_cost': 0.0,
@@ -286,25 +319,39 @@ class HeuristicMapper:
         """
         # Track start time for timeout checking
         start_time = time.time()
+        self._route_metadata = None
+
+        def _make_placer(seed: int) -> AnnealPlacer:
+            return AnnealPlacer(
+                num_rows=self._mrrg.rows,
+                num_cols=self._mrrg.cols,
+                dfg=self._dfg,
+                latency_spec=self._latency_spec,
+                mrrg=self._mrrg,
+                fixed_placement=[],
+                random_seed=seed,
+                swap_factor=self._swap_factor
+            )
 
         # Initialize placer
-        placer = AnnealPlacer(
-            num_rows=self._mrrg.rows,
-            num_cols=self._mrrg.cols,
-            dfg=self._dfg,
-            latency_spec=self._latency_spec,
-            mrrg=self._mrrg,
-            fixed_placement=[],
-            random_seed=self._random_seed,
-            swap_factor=self._swap_factor
-        )
-
-        # Set initial placement
-        placer.set_initial_placement()
+        current_seed = self._random_seed
+        placer = _make_placer(current_seed)
+        if self._best_placement_hint or self._fu_failure_penalties:
+            placer.set_initial_placement_with_history(
+                dfg_to_fu_hints=self._best_placement_hint,
+                fu_penalties=self._fu_failure_penalties,
+                explore_probability=0.35,
+            )
+        else:
+            placer.set_initial_placement()
 
         # Initialize temperature and convergence tracking
         temperature = self._initial_temperature
         cost_history = deque(maxlen=self._convergence_window)
+        best_uncovered = float("inf")
+        stagnant_routing_iters = 0
+        iterations_since_coverage_improvement = 0
+        placement_restarts = 0
 
         # Iterative loop
         for iteration in range(self._max_iterations):
@@ -323,7 +370,7 @@ class HeuristicMapper:
                 print(f"\n--- Iteration {self._iterations_run} (T={temperature:.2f}) ---")
 
             # Run annealing at current temperature
-            placer.anneal(initial_temperature=temperature)
+            acceptance_rate = placer.anneal(initial_temperature=temperature)
             self._placement = placer._op_node_placement_map.copy()
             self._final_cost = placer.get_total_cost()
 
@@ -338,14 +385,18 @@ class HeuristicMapper:
                 p_growth_rate=self._p_growth_rate,
                 h_growth_rate=self._h_growth_rate,
                 max_iterations=self._router_max_iterations,
+                historical_cost_seed=self._routing_history_costs,
+                bitwidth_mismatch_cost=self._bitwidth_mismatch_penalty_weight,
                 debug=self._debug
             )
 
             routing_success = router.route_dfg()
+            self._merge_routing_history(router)
 
             if routing_success:
                 # Success! Save routing solution and exit
                 self._routing_solution = router._routing_solution
+                self._route_metadata = router.get_route_metadata()
 
                 if self._debug:
                     print(f"\n✓ Routing succeeded at iteration {self._iterations_run}")
@@ -356,8 +407,58 @@ class HeuristicMapper:
             if self._debug:
                 print("✗ Routing failed, adjusting temperature and retrying")
 
+            uncovered = getattr(router, "_last_uncovered_hypervals", None)
+            if uncovered is None:
+                uncovered = float("inf")
+
+            if uncovered < best_uncovered:
+                best_uncovered = uncovered
+                self._best_placement_hint = {
+                    dfg_node.id: fu_node.id for dfg_node, fu_node in self._placement.items()
+                }
+                stagnant_routing_iters = 0
+                iterations_since_coverage_improvement = 0
+            else:
+                stagnant_routing_iters += 1
+                iterations_since_coverage_improvement += 1
+            self._accumulate_fu_failure_penalties(uncovered)
+
+            # Placement appears locally impossible to route: restart from fresh placement.
+            if (
+                stagnant_routing_iters >= self._placement_restart_patience
+                and placement_restarts < self._max_placement_restarts
+            ):
+                placement_restarts += 1
+                current_seed = self._random_seed + (placement_restarts * 1009) + self._iterations_run
+                if self._debug:
+                    print(
+                        f"[RESTART] Restarting placement at II={self._mrrg.II} "
+                        f"(restart {placement_restarts}/{self._max_placement_restarts}, "
+                        f"best_uncovered={best_uncovered}, seed={current_seed})"
+                    )
+                placer = _make_placer(current_seed)
+                placer.set_initial_placement_with_history(
+                    dfg_to_fu_hints=self._best_placement_hint,
+                    fu_penalties=self._fu_failure_penalties,
+                    explore_probability=0.25,
+                )
+                temperature = self._initial_temperature
+                cost_history.clear()
+                stagnant_routing_iters = 0
+                continue
+
+            # Too many placement iterations with no coverage improvement at this II:
+            # hand control back to map() so it can escalate II and re-schedule.
+            if iterations_since_coverage_improvement >= self._ii_iteration_patience:
+                if self._debug:
+                    print(
+                        f"[II-ESCALATE] No routing coverage improvement for "
+                        f"{iterations_since_coverage_improvement} placement iterations "
+                        f"at II={self._mrrg.II}. Moving to next II."
+                    )
+                return False
+
             # Adaptive temperature adjustment based on acceptance rate
-            acceptance_rate = placer._acceptance_rate if hasattr(placer, '_acceptance_rate') else 0.3
             temperature = self._adjust_temperature(temperature, acceptance_rate)
 
             # Early stopping if cost plateaus
@@ -373,6 +474,22 @@ class HeuristicMapper:
             print(f"\n✗ Failed to route after {self._iterations_run} iterations")
 
         return False
+
+    def _merge_routing_history(self, router: PathFinder) -> None:
+        """Persist routing congestion history across placement retries."""
+        current_history = router.export_historical_costs()
+        for node_id, new_cost in current_history.items():
+            prev = self._routing_history_costs.get(node_id, 0.0)
+            # Keep memory of prior congestion while favoring newer evidence.
+            self._routing_history_costs[node_id] = min(1_000_000.0, max(prev * 0.9, new_cost))
+
+    def _accumulate_fu_failure_penalties(self, uncovered: float) -> None:
+        """Penalize FUs repeatedly used in failed placements."""
+        if not self._placement:
+            return
+        bump = max(0.5, min(5.0, float(uncovered) / max(1.0, len(self._placement))))
+        for _, fu_node in self._placement.items():
+            self._fu_failure_penalties[fu_node.id] = self._fu_failure_penalties.get(fu_node.id, 0.0) + bump
 
     def _adjust_temperature(self, current_temp: float, acceptance_rate: float) -> float:
         """

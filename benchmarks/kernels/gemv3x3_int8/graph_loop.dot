@@ -1,0 +1,82 @@
+digraph G {
+    // Shared activation vector (8-bit, each fans out to 3 muls)
+    x0 [opcode=input, bitwidth=8];
+    x1 [opcode=input, bitwidth=8];
+    x2 [opcode=input, bitwidth=8];
+    // Weight matrix row 0
+    a00 [opcode=input, bitwidth=8];
+    a01 [opcode=input, bitwidth=8];
+    a02 [opcode=input, bitwidth=8];
+    // Weight matrix row 1
+    a10 [opcode=input, bitwidth=8];
+    a11 [opcode=input, bitwidth=8];
+    a12 [opcode=input, bitwidth=8];
+    // Weight matrix row 2
+    a20 [opcode=input, bitwidth=8];
+    a21 [opcode=input, bitwidth=8];
+    a22 [opcode=input, bitwidth=8];
+    // Row 0 multiplies: A[0][j] * x[j]
+    mul_00 [opcode=mul, bitwidth=32];
+    mul_01 [opcode=mul, bitwidth=32];
+    mul_02 [opcode=mul, bitwidth=32];
+    // Row 1 multiplies: A[1][j] * x[j]
+    mul_10 [opcode=mul, bitwidth=32];
+    mul_11 [opcode=mul, bitwidth=32];
+    mul_12 [opcode=mul, bitwidth=32];
+    // Row 2 multiplies: A[2][j] * x[j]
+    mul_20 [opcode=mul, bitwidth=32];
+    mul_21 [opcode=mul, bitwidth=32];
+    mul_22 [opcode=mul, bitwidth=32];
+    // Row 0 reduction tree
+    add_r0_01 [opcode=add, bitwidth=32];
+    add_r0_012 [opcode=add, bitwidth=32];
+    // Row 1 reduction tree
+    add_r1_01 [opcode=add, bitwidth=32];
+    add_r1_012 [opcode=add, bitwidth=32];
+    // Row 2 reduction tree
+    add_r2_01 [opcode=add, bitwidth=32];
+    add_r2_012 [opcode=add, bitwidth=32];
+    // Re-quantized 8-bit outputs
+    y0 [opcode=output, bitwidth=8];
+    y1 [opcode=output, bitwidth=8];
+    y2 [opcode=output, bitwidth=8];
+    // === Edges: activation vector x (shared, fanout=3 each) ===
+    x0 -> mul_00 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    x0 -> mul_10 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    x0 -> mul_20 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    x1 -> mul_01 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    x1 -> mul_11 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    x1 -> mul_21 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    x2 -> mul_02 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    x2 -> mul_12 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    x2 -> mul_22 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    // === Edges: weight matrix A (fanout=1 each) ===
+    a00 -> mul_00 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    a01 -> mul_01 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    a02 -> mul_02 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    a10 -> mul_10 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    a11 -> mul_11 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    a12 -> mul_12 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    a20 -> mul_20 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    a21 -> mul_21 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    a22 -> mul_22 [operand=any2input, bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    // === Edges: row 0 reduction ===
+    mul_00 -> add_r0_01 [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    mul_01 -> add_r0_01 [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    add_r0_01 -> add_r0_012 [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    mul_02 -> add_r0_012 [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    // === Edges: row 1 reduction ===
+    mul_10 -> add_r1_01 [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    mul_11 -> add_r1_01 [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    add_r1_01 -> add_r1_012 [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    mul_12 -> add_r1_012 [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    // === Edges: row 2 reduction ===
+    mul_20 -> add_r2_01 [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    mul_21 -> add_r2_01 [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    add_r2_01 -> add_r2_012 [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    mul_22 -> add_r2_012 [operand=any2input, bitwidth=32, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    // === Edges: outputs (narrowed 32b → 8b) ===
+    add_r0_012 -> y0 [bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    add_r1_012 -> y1 [bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+    add_r2_012 -> y2 [bitwidth=8, dist=0, kind="dataflow", predicate=false, is_loop_back=false];
+}

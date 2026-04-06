@@ -1,7 +1,7 @@
 """PathFrinder Algorithm for heuristic mapping."""
 
 import heapq
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Any, Dict, List, Set, Tuple, Optional
 
 from mapper.graph.dfg import DFG, DFGNode
 from mapper.graph.mrrg import MRRG, MRRGNode, NodeType, OperandTag
@@ -41,9 +41,10 @@ class PathFinder:
 
     # Routing solution
     _routing_solution: Dict[Tuple[HyperVal, int], List[MRRGNode]]
+    _route_profiles: Dict[Tuple[HyperVal, int], Dict[str, Any]]
 
     # Global map: routing node -> set of HyperVal IDs that currently use it
-    _global_routes: Dict[MRRGNode, Set[int]]
+    _global_routes: Dict[MRRGNode, Set[str]]
 
     # Dual use nodes
     _used_routing_fu_nodes: Set[MRRGNode]
@@ -51,8 +52,55 @@ class PathFinder:
     # Maximum routing iterations
     _max_iterations: int
 
+    # Allow this many extra modulo wraps for timing-feasible routing
+    _timing_slack_iis: int
+
+    # Stop negotiation when coverage stalls this many iterations
+    _stagnation_patience: int
+
     # Debug mode
     _debug: bool
+
+    # Diagnostics: uncovered hypervals from last coverage check
+    _last_uncovered_hypervals: int
+
+    # Width mismatch cost: penalty per unit width ratio above 1.0.
+    # Penalizes routing narrow data on wide routing links.
+    WIDTH_MISMATCH_COST: float = 0.5
+
+    @staticmethod
+    def _strip_cycle_prefix(node_id: str) -> str:
+        """Convert '2:foo.bar' -> 'foo.bar'."""
+        if ":" in node_id:
+            return node_id.split(":", 1)[1]
+        return node_id
+
+    def _violates_sink_pin_binding(
+        self,
+        node: MRRGNode,
+        sink: MRRGNode,
+        tag_to_find: Optional[OperandTag],
+    ) -> bool:
+        """Return True when node conflicts with required sink operand pin.
+
+        For memory ops, prevent address operands from traversing sink `data_i*`
+        pins and prevent data operands from traversing sink `addr_i*` pins.
+        """
+        if tag_to_find not in (OperandTag.MEM_ADDR, OperandTag.MEM_DATA):
+            return False
+
+        node_bare = self._strip_cycle_prefix(node.id)
+        sink_bare = self._strip_cycle_prefix(sink.id)
+        sink_prefix = f"{sink_bare}."
+        if not node_bare.startswith(sink_prefix):
+            return False
+
+        lower_node = node_bare.lower()
+        if tag_to_find == OperandTag.MEM_ADDR and "data_i" in lower_node:
+            return True
+        if tag_to_find == OperandTag.MEM_DATA and "addr_i" in lower_node:
+            return True
+        return False
 
     def __init__(
         self,
@@ -64,6 +112,10 @@ class PathFinder:
         p_factor_initial: float = 1.0,
         h_factor_initial: float = 1.0,
         max_iterations: int = 70,
+        timing_slack_iis: int = 3,
+        stagnation_patience: int = 10,
+        historical_cost_seed: Optional[Dict[str, float]] = None,
+        bitwidth_mismatch_cost: float = WIDTH_MISMATCH_COST,
         debug: bool = False
     ) -> None:
         """
@@ -78,6 +130,14 @@ class PathFinder:
             p_factor_initial: Initial present congestion penalty multiplier
             h_factor_initial: Initial historical congestion penalty multiplier
             max_iterations: Maximum number of negotiation iterations (default 70)
+            timing_slack_iis: Allow up to this many extra II wraps in timing
+                             when routing (default 1)
+            stagnation_patience: Break negotiation if uncovered count does not
+                                improve for this many iterations
+            historical_cost_seed: Optional persistent per-node congestion
+                                 history from previous routing attempts
+            bitwidth_mismatch_cost: Soft cost weight for routing on wider-than-
+                                   required interconnect bitwidth
             debug: Enable debug output (default False)
         """
         self._dfg = dfg
@@ -103,6 +163,10 @@ class PathFinder:
         for mrrg_node in mrrg.get_nodes():
             if mrrg_node.node_type == NodeType.ROUTING:
                 self._routing_nodes[mrrg_node] = RoutingNodePlacementState()
+                if historical_cost_seed is not None:
+                    seeded = historical_cost_seed.get(mrrg_node.id)
+                    if seeded is not None:
+                        self._routing_nodes[mrrg_node].historical_cost = max(0.0, float(seeded))
 
         # Penalty factors and growth rates
         self._p_growth_rate = p_growth_rate
@@ -114,6 +178,7 @@ class PathFinder:
 
         # Routing solution: (HyperVal, dest_idx) -> path of MRRG nodes
         self._routing_solution = {}
+        self._route_profiles = {}
 
         # Global HyperVal ownership per routing node
         self._global_routes = {}
@@ -121,8 +186,71 @@ class PathFinder:
         # Maximum negotiation iterations
         self._max_iterations = max_iterations
 
+        # Allow bounded extra modulo wraps to relax exact-timing failures.
+        self._timing_slack_iis = max(0, timing_slack_iis)
+        self._stagnation_patience = max(1, stagnation_patience)
+        self._bitwidth_mismatch_cost = max(0.0, float(bitwidth_mismatch_cost))
+
         # Debug mode
         self._debug = debug
+        self._last_uncovered_hypervals = 0
+
+    def export_historical_costs(self) -> Dict[str, float]:
+        """Export per-routing-node history for reuse across router restarts."""
+        history: Dict[str, float] = {}
+        for node, state in self._routing_nodes.items():
+            if state.historical_cost > 0.0:
+                history[node.id] = state.historical_cost
+        return history
+
+    def get_route_metadata(self) -> Dict[Tuple[str, int], Dict[str, Any]]:
+        """Export route metadata in a CGRA-Solve-compatible shape.
+
+        This prepares router-side metadata plumbing for packed/fractured routing.
+        Current router behavior is flat, but we still emit a stable schema so
+        mixed-precision extensions can populate lane/fracture details later.
+        """
+        metadata: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for (hyperval, dest_idx), path in self._routing_solution.items():
+            path_ids = [node.id for node in path]
+            profile = self._route_profiles.get((hyperval, dest_idx), {})
+            lane_assignments = dict(profile.get("lane_assignments", {}))
+            active_pack_nodes = list(profile.get("active_pack_nodes", []))
+            active_unpack_nodes = list(profile.get("active_unpack_nodes", []))
+            lane_width = profile.get("lane_width")
+            transport_mode = str(profile.get("transport_mode", "flat"))
+            fractured = bool(profile.get("fractured", False))
+            chunk_indices = list(profile.get("chunk_indices", []))
+            chunk_widths = list(profile.get("chunk_widths", []))
+            chunk_offsets = list(profile.get("chunk_offsets", []))
+
+            total_bitwidth: Optional[int] = None
+            if (
+                hyperval.bitwidths
+                and dest_idx < len(hyperval.bitwidths)
+                and isinstance(hyperval.bitwidths[dest_idx], int)
+            ):
+                total_bitwidth = int(hyperval.bitwidths[dest_idx])
+
+            lane_index = profile.get("lane_index")
+
+            metadata[(hyperval.source_id, dest_idx)] = {
+                "paths": [path_ids],
+                "transport_mode": transport_mode,
+                "fractured": fractured,
+                "num_chunks": len(set(chunk_indices)) if chunk_indices else (1 if not fractured else 0),
+                "chunk_indices": sorted(set(chunk_indices)),
+                "chunk_widths": sorted(set(chunk_widths)),
+                "chunk_offsets": sorted(set(chunk_offsets)),
+                "lane_assignments": dict(lane_assignments),
+                "active_pack_nodes": sorted(set(active_pack_nodes)),
+                "active_unpack_nodes": sorted(set(active_unpack_nodes)),
+                "total_bitwidth": total_bitwidth,
+                "lane_width": lane_width,
+                "lane_index": lane_index,
+            }
+
+        return metadata
 
     def _compute_cycles_source_to_sink(
         self,
@@ -151,25 +279,8 @@ class PathFinder:
         """
         II = self._mrrg.II
 
-        # Use placement-based cycles when in modulo scheduling mode
-        if src_fu is not None and sink_fu is not None and II is not None and II > 1:
-            src_cycle = src_fu.cycle
-            sink_cycle = sink_fu.cycle
-
-            # Self-loop: wrap around the full II
-            if source_node == sink_node:
-                return II
-
-            # Modular distance: how many cycles to go from src to sink in the II ring
-            cycles_to_sink = (sink_cycle - src_cycle) % II
-
-            # Loop-carried edges add full II iterations
-            if edge_dist > 0:
-                cycles_to_sink += edge_dist * II
-
-            return cycles_to_sink
-
-        # Fallback: use ASAP scheduling times (works for II=1)
+        # Timing should follow the scheduled DFG relation, not incidental FU cycle
+        # assignments, so routing remains stable across equivalent placements.
         source_time = source_node.asap_time
         sink_time = sink_node.asap_time
 
@@ -184,7 +295,8 @@ class PathFinder:
         if II is not None and cycles_to_sink < 0:
             cycles_to_sink = II - (abs(cycles_to_sink) % II)
 
-        if II is not None and sink_node == source_node:
+        # Loop-carried self-edges already encode cross-iteration timing via dist*II.
+        if II is not None and sink_node == source_node and edge_dist == 0:
             cycles_to_sink = II
 
         if edge_dist > 0 and II is not None:
@@ -234,7 +346,70 @@ class PathFinder:
         total_cost = base_cost + h_cost + oc_cost
         return total_cost
 
-    def _commit_node(self, hyperval_net: Tuple[HyperVal, int], node: MRRGNode) -> None:
+    def _update_historical_costs(self) -> None:
+        """
+        Update historical congestion from current occupancy.
+
+        This mirrors negotiated-congestion behavior in CGRA-Solve: each
+        negotiation iteration reinforces persistently overused nodes,
+        independent of rip-up order.
+        """
+        for node, state in self._routing_nodes.items():
+            overuse = max(0, state.occupancy - node.capacity)
+            if overuse > 0:
+                state.historical_cost += float(overuse)
+
+    def _diversify_when_uncovered_but_legal(self) -> None:
+        """
+        Nudge history when routing is legal yet still uncovered.
+
+        In this regime, classic overuse-based history remains unchanged,
+        which can make reroutes replay the exact same solution. Apply a small
+        history bump to currently occupied nodes to encourage alternate trunks.
+        """
+        for _, state in self._routing_nodes.items():
+            if state.occupancy > 0:
+                state.historical_cost += 0.25
+
+    def _compute_hyperval_priority(self, hyperval_info: HyperValNetInfo) -> Tuple[int, float, int, int]:
+        """
+        Compute dynamic negotiation priority for one HyperVal.
+
+        Priority order (higher first):
+        1) uncovered sinks
+        2) conflict score (sum overuse on currently used nodes)
+        3) fanout
+        4) max timing span
+        """
+        hyperval = hyperval_info.hyperval
+
+        uncovered = 0
+        for dest_idx in range(hyperval.cardinality):
+            if (hyperval, dest_idx) not in self._routing_solution:
+                uncovered += 1
+
+        conflict_score = 0.0
+        seen_nodes: Set[MRRGNode] = set()
+        for dest_idx in range(hyperval.cardinality):
+            route = self._routing_solution.get((hyperval, dest_idx))
+            if route is None:
+                continue
+            for node in route:
+                if node in seen_nodes:
+                    continue
+                seen_nodes.add(node)
+                if node in self._routing_nodes:
+                    state = self._routing_nodes[node]
+                    conflict_score += float(max(0, state.occupancy - node.capacity))
+
+        return (uncovered, conflict_score, hyperval_info.fanout, hyperval_info.max_cycles)
+
+    def _commit_node(
+        self,
+        hyperval_net: Tuple[HyperVal, int],
+        node: MRRGNode,
+        lane_index: Optional[int] = None,
+    ) -> None:
         """
         Commit a routing decision - add node to route.
 
@@ -276,6 +451,210 @@ class PathFinder:
         else:
             users.add(hv_id)
 
+        # Optional lane ownership for packed routes.
+        if lane_index is not None and getattr(node, "num_lanes", None):
+            lane_users = state.packed_lane_usage.setdefault(int(lane_index), set())
+            lane_users.add(hv_id)
+
+    def _allowed_lanes_for_node(self, node: MRRGNode) -> Set[int]:
+        """Return legal lane indices for a lane-capable node."""
+        num_lanes = getattr(node, "num_lanes", None)
+        if not isinstance(num_lanes, int) or num_lanes <= 1:
+            return set()
+        allowed = getattr(node, "allowed_lane_indices", None)
+        if isinstance(allowed, tuple) and allowed:
+            return {lane for lane in allowed if isinstance(lane, int)}
+        if isinstance(allowed, list) and allowed:
+            return {lane for lane in allowed if isinstance(lane, int)}
+        return set(range(num_lanes))
+
+    def _select_packed_lane(
+        self,
+        route: List[MRRGNode],
+        hyperval: HyperVal,
+    ) -> Optional[int]:
+        """Choose a common lane index for all lane-capable nodes in route."""
+        lane_nodes = [node for node in route if self._allowed_lanes_for_node(node)]
+        if not lane_nodes:
+            return None
+
+        common_lanes: Optional[Set[int]] = None
+        for node in lane_nodes:
+            allowed = self._allowed_lanes_for_node(node)
+            common_lanes = allowed if common_lanes is None else common_lanes & allowed
+            if not common_lanes:
+                return None
+
+        hv_id = hyperval.source_id
+        best_lane: Optional[int] = None
+        best_score: Optional[int] = None
+        for lane in sorted(common_lanes or set()):
+            score = 0
+            for node in lane_nodes:
+                state = self._routing_nodes.get(node)
+                if state is None:
+                    continue
+                lane_users = state.packed_lane_usage.get(lane, set())
+                # Prefer unused lanes, then lanes already used by same HyperVal.
+                if lane_users and hv_id not in lane_users:
+                    score += 1
+            if best_score is None or score < best_score:
+                best_lane = lane
+                best_score = score
+        return best_lane
+
+    def _build_transport_profile(
+        self,
+        route: List[MRRGNode],
+        hyperval: HyperVal,
+        required_bitwidth: Optional[int],
+    ) -> Dict[str, Any]:
+        """Construct per-route transport metadata for mixed precision."""
+        lane_index = self._select_packed_lane(route, hyperval)
+        lane_width_candidates = [
+            int(node.lane_width)
+            for node in route
+            if isinstance(getattr(node, "lane_width", None), int) and int(node.lane_width) > 0
+        ]
+        lane_width = min(lane_width_candidates) if lane_width_candidates else None
+
+        lane_assignments: Dict[str, int] = {}
+        if lane_index is not None:
+            for node in route:
+                if self._allowed_lanes_for_node(node):
+                    lane_assignments[node.id] = lane_index
+
+        pack_nodes = [node.id for node in route if bool(getattr(node, "pack_capable", False))]
+        unpack_nodes = [node.id for node in route if bool(getattr(node, "unpack_capable", False))]
+        active_pack_nodes = [pack_nodes[0]] if pack_nodes else []
+        active_unpack_nodes = [unpack_nodes[-1]] if unpack_nodes else []
+
+        fractured = False
+        chunk_indices = sorted(
+            {
+                int(node.fracture_chunk_index)
+                for node in route
+                if isinstance(getattr(node, "fracture_chunk_index", None), int)
+            }
+        )
+        chunk_widths = sorted(
+            {
+                int(node.fracture_chunk_width)
+                for node in route
+                if isinstance(getattr(node, "fracture_chunk_width", None), int)
+            }
+        )
+        chunk_offsets = sorted(
+            {
+                int(node.fracture_bit_offset)
+                for node in route
+                if isinstance(getattr(node, "fracture_bit_offset", None), int)
+            }
+        )
+        if chunk_indices or chunk_widths or chunk_offsets:
+            fractured = True
+
+        if lane_assignments and active_pack_nodes and active_unpack_nodes:
+            transport_mode = "packed"
+        elif fractured:
+            transport_mode = "fractured"
+        else:
+            transport_mode = "flat"
+
+        return {
+            "transport_mode": transport_mode,
+            "lane_index": lane_index,
+            "lane_width": lane_width,
+            "lane_assignments": lane_assignments,
+            "active_pack_nodes": active_pack_nodes,
+            "active_unpack_nodes": active_unpack_nodes,
+            "fractured": fractured,
+            "chunk_indices": chunk_indices,
+            "chunk_widths": chunk_widths,
+            "chunk_offsets": chunk_offsets,
+            "required_bitwidth": required_bitwidth,
+        }
+
+    def _score_route(self, route: List[MRRGNode]) -> float:
+        """
+        Score a candidate route using current negotiated-congestion costs.
+
+        Lower score is better.
+        """
+        if not route:
+            return float("inf")
+        return sum(self._compute_cost(node) for node in route)
+
+    def _compute_prospective_cost(
+        self,
+        node: MRRGNode,
+        hyperval: HyperVal,
+        speculative_hv_nodes: Optional[Set[MRRGNode]] = None,
+    ) -> float:
+        """
+        Cost as if this HyperVal were additionally routed through ``node``.
+
+        Like CGRA-Solve, same-HyperVal reuse does not increase prospective
+        occupancy (important for multi-sink routing with shared trunks).
+        """
+        if node not in self._routing_nodes:
+            return 1.0
+
+        state = self._routing_nodes[node]
+        prospective_occ = state.occupancy
+
+        if hyperval not in state.hyperval_usage:
+            if speculative_hv_nodes is None or node not in speculative_hv_nodes:
+                prospective_occ += 1
+
+        base_cost = state.base_cost
+        historical_cost = state.historical_cost
+        h_cost = self._h_factor * historical_cost
+        overuse = max(0, prospective_occ - node.capacity)
+        oc_cost = 1.0 + self._p_factor * overuse
+        return base_cost + h_cost + oc_cost
+
+    def _score_candidate_route(
+        self,
+        root_fanout: MRRGNode,
+        route: List[MRRGNode],
+        hyperval: HyperVal,
+        required_bitwidth: Optional[int] = None,
+        speculative_hv_nodes: Optional[Set[MRRGNode]] = None,
+    ) -> float:
+        """
+        Score one fanout candidate including root fanout congestion.
+
+        Dijkstra seeds at fanout with zero start cost, so we explicitly include
+        fanout here to avoid biasing toward congested roots.
+        """
+        seen: Set[MRRGNode] = set()
+        total = 0.0
+        for node in [root_fanout, *route]:
+            if node in seen:
+                continue
+            seen.add(node)
+            total += self._compute_prospective_cost(
+                node=node,
+                hyperval=hyperval,
+                speculative_hv_nodes=speculative_hv_nodes,
+            )
+            total += self._compute_bitwidth_mismatch_penalty(node, required_bitwidth)
+        return total
+
+    def _compute_bitwidth_mismatch_penalty(
+        self,
+        node: MRRGNode,
+        required_bitwidth: Optional[int],
+    ) -> float:
+        """Soft-penalize using wider interconnect than the payload requires."""
+        if required_bitwidth is None or required_bitwidth <= 0:
+            return 0.0
+        if node.bitwidth <= required_bitwidth:
+            return 0.0
+        width_ratio = node.bitwidth / required_bitwidth
+        return (width_ratio - 1.0) * self._bitwidth_mismatch_cost
+
     def _rip_up_hyperval_net(self, hyperval_net: Tuple[HyperVal, int]) -> None:
         """
         Remove routing for a net and update historical costs.
@@ -291,6 +670,8 @@ class PathFinder:
 
         route = self._routing_solution[hyperval_net]
         hyperval, _ = hyperval_net
+        profile = self._route_profiles.get(hyperval_net, {})
+        lane_index = profile.get("lane_index")
 
         # For each node in the route
         for node in route:
@@ -342,8 +723,17 @@ class PathFinder:
                 if node in self._global_routes:
                     del self._global_routes[node]
 
+            if lane_index is not None and isinstance(lane_index, int):
+                lane_users = state.packed_lane_usage.get(lane_index)
+                if lane_users is not None:
+                    lane_users.discard(hyperval.source_id)
+                    if not lane_users:
+                        del state.packed_lane_usage[lane_index]
+
         # Clear the routing
         del self._routing_solution[hyperval_net]
+        if hyperval_net in self._route_profiles:
+            del self._route_profiles[hyperval_net]
 
     def _rip_up_hyperval(self, hyperval: HyperVal) -> None:
         """
@@ -435,6 +825,9 @@ class PathFinder:
                     num_uncovered += 1
                     uncovered_nets.append(hyperval_net)
 
+        # Save uncovered count for external orchestration (e.g., placement restarts).
+        self._last_uncovered_hypervals = num_uncovered
+
         if not is_covered:
             print(f"  [UNCOVERED] {num_uncovered} hypervals not routed")
 
@@ -493,8 +886,10 @@ class PathFinder:
         sink: MRRGNode,
         tag_to_find: Optional[OperandTag],
         hyperval: HyperVal,
+        required_bitwidth: Optional[int],
         routes: Set[MRRGNode],
-        cycles_to_sink: int,
+        min_cycles_to_sink: int,
+        max_cycles_to_sink: int,
         latency_of_src: int
     ) -> List[MRRGNode]:
         """
@@ -506,52 +901,57 @@ class PathFinder:
             tag_to_find: Required operand tag (or None for UNTAGGED)
             hyperval: HyperVal being routed (for bitwidth checking)
             routes: Nodes already used by other sinks of this HyperVal
-            cycles_to_sink: Required arrival time at sink
+            min_cycles_to_sink: Minimum required arrival time at sink
+            max_cycles_to_sink: Maximum allowed arrival time at sink
             latency_of_src: Starting latency
 
         Returns:
             Path as list of MRRG nodes, or [] if not found
         """
 
-        # Storage: (node, latency) -> VertexData
-        data: Dict[Tuple[MRRGNode, int], VertexData] = {}
+        # Nodes already claimed by earlier sinks of this HyperVal.
+        speculative_hv_nodes: Set[MRRGNode]
+        if isinstance(routes, dict):
+            speculative_hv_nodes = set(routes.keys())
+        else:
+            speculative_hv_nodes = set(routes)
+
+        # Storage: (node, latency, tag_found) -> VertexData
+        data: Dict[Tuple[MRRGNode, int, bool], VertexData] = {}
 
         # Priority queue
         to_visit: List[VertexAndCost] = []
 
-        # Visited states
-        visited: Set[Tuple[MRRGNode, int]] = set()
-
-        heapq.heappush(to_visit, VertexAndCost(0.0, latency_of_src, source))
-        data[(source, latency_of_src)] = VertexData(
+        heapq.heappush(to_visit, VertexAndCost(0.0, latency_of_src, source, False))
+        data[(source, latency_of_src, False)] = VertexData(
             fanin=[],  # Fanin represents path TO node (excluding node itself)
             lowest_known_cost=0.0,
             num_of_cycles=latency_of_src,
             tag_found=False
         )
 
-        found: Optional[MRRGNode] = None
-        tag_found = False
+        found_state: Optional[Tuple[MRRGNode, int, bool]] = None
 
-        while to_visit and not found:
+        while to_visit and not found_state:
             # Get lowest-cost unexplored node
             queue_top = heapq.heappop(to_visit)
             explore_curr = queue_top.node
             cycles_to_curr = queue_top.cycles
+            tag_found_curr = queue_top.tag_found
+            state_key = (explore_curr, cycles_to_curr, tag_found_curr)
 
-            # Skip if already visited
-            if (explore_curr, cycles_to_curr) in visited:
+            # Reopen-safe: skip stale queue entries whose cost is worse
+            # than the best known cost for this state.
+            best = data.get(state_key)
+            if best is None:
+                continue
+            if queue_top.cost_to_here > best.lowest_known_cost:
                 continue
 
-            if not found and sink == explore_curr:
+            if sink == explore_curr:
                 # Check timing constraint
-                if cycles_to_sink == cycles_to_curr:
-                    found = explore_curr # Found the sink
-                else:
-                    # Wrong timing - mark visited and continue
-                    visited.add((explore_curr, cycles_to_curr))
-                    if (explore_curr, cycles_to_curr) in data:
-                        del data[(explore_curr, cycles_to_curr)]
+                if min_cycles_to_sink <= cycles_to_curr <= max_cycles_to_sink:
+                    found_state = state_key
                 continue
 
             for fanout_edge in self._mrrg.get_outgoing_edges(explore_curr.id):
@@ -559,12 +959,13 @@ class PathFinder:
                 if not fanout:
                     continue
 
-                tag_found = False  # Reset for each neighbor
-
                 if fanout == source:
                     continue
 
                 if fanout.node_type == NodeType.FUNCTION and fanout != sink:
+                    continue
+
+                if self._violates_sink_pin_binding(fanout, sink, tag_to_find):
                     continue
 
                 if fanout.node_type == NodeType.ROUTING_FUNCTION:
@@ -572,22 +973,29 @@ class PathFinder:
                         continue
 
                 # Make sure bitwidth is compatible
-                if hyperval.bitwidths and hyperval.bitwidths[0]:
-                    if fanout.bitwidth < hyperval.bitwidths[0]:
+                if required_bitwidth:
+                    if fanout.bitwidth < required_bitwidth:
                         continue
 
                 current_hv_id = hyperval.source_id
                 global_users = self._global_routes.get(fanout, set())
 
                 if global_users and current_hv_id not in global_users:
-                    # Another HyperVal already owns this node: illegal short
-                    continue
+                    # Capacity-aware sharing: allow a different HyperVal to use this node
+                    # only when there is still free capacity for distinct HyperVals.
+                    if len(global_users) >= fanout.capacity:
+                        continue
 
-                data_curr = data[(explore_curr, cycles_to_curr)]
+                data_curr = data[state_key]
                 if data_curr.tag_found and fanout != sink:
                     continue
 
-                cost = queue_top.cost_to_here + self._compute_cost(fanout)
+                cost = queue_top.cost_to_here + self._compute_prospective_cost(
+                    fanout,
+                    hyperval,
+                    speculative_hv_nodes,
+                )
+                cost += self._compute_bitwidth_mismatch_penalty(fanout, required_bitwidth)
                 cycles = data_curr.num_of_cycles
 
                 if fanout in data_curr.fanin:
@@ -597,14 +1005,15 @@ class PathFinder:
                 if fanout.node_type != NodeType.FUNCTION:
                     cycles = cycles + explore_curr.latency
 
-                if cycles > cycles_to_sink:
+                if cycles > max_cycles_to_sink:
                     continue
 
-                if (fanout, cycles) in data:
-                    if data[(fanout, cycles)].lowest_known_cost <= cost:
+                # Determine tag_found state for this neighbor
+                tag_found_new = data_curr.tag_found
+
+                if (fanout, cycles, tag_found_new) in data:
+                    if data[(fanout, cycles, tag_found_new)].lowest_known_cost <= cost:
                         continue  # Existing path is better
-                    else:
-                        del data[(fanout, cycles)]  # Replace worse path
 
                 if len(fanout.supported_operand_tags) > 0 and tag_to_find is not None:
                     if fanout.node_type != NodeType.ROUTING_FUNCTION:
@@ -617,7 +1026,7 @@ class PathFinder:
                         if fanout in self._routing_nodes:
                             if len(self._routing_nodes[fanout].values) == 0 and \
                                fanout not in routes:
-                                tag_found = True
+                                tag_found_new = True
                     elif tag_to_find == OperandTag.PREDICATE:
                         # Special handling for predicate tags
                         if tag_to_find not in fanout.supported_operand_tags:
@@ -625,36 +1034,29 @@ class PathFinder:
                         if fanout in self._routing_nodes:
                             if len(self._routing_nodes[fanout].values) == 0 and \
                                fanout not in routes:
-                                tag_found = True
+                                tag_found_new = True
 
-                    if not tag_found:
+                    if not tag_found_new:
                         continue  # Tag requirement not met
 
                 # Copy path from current node and append explore_curr
                 new_fanin = data_curr.fanin.copy()
                 new_fanin.append(explore_curr)
 
-                data[(fanout, cycles)] = VertexData(
+                data[(fanout, cycles, tag_found_new)] = VertexData(
                     fanin=new_fanin,
                     lowest_known_cost=cost,
                     num_of_cycles=cycles,
-                    tag_found=tag_found
+                    tag_found=tag_found_new
                 )
 
                 # Add to priority queue
-                heapq.heappush(to_visit, VertexAndCost(cost, cycles, fanout))
+                heapq.heappush(to_visit, VertexAndCost(cost, cycles, fanout, tag_found_new))
 
-                tag_found = False  # Reset for next iteration
-
-            # Mark current node as visited and clean up
-            visited.add((explore_curr, cycles_to_curr))
-            if (explore_curr, cycles_to_curr) in data:
-                del data[(explore_curr, cycles_to_curr)]
-
-        if not found:
+        if not found_state:
             return []
 
-        final_data = data[(sink, cycles_to_sink)]
+        final_data = data[found_state]
         return final_data.fanin
 
     def _route_hyperval(self, hyperval: HyperVal) -> bool:
@@ -695,12 +1097,17 @@ class PathFinder:
 
         src_fu = self._placement[src_dfg_node]
         latency_of_src = src_fu.latency
-
-        # Get first fanout of source FU (start routing from here)
+        # Get candidate fanouts of source FU (HyCUBE FUs can have multiple egress nets)
         fanout_edges = self._mrrg.get_outgoing_edges(src_fu.id)
         if not fanout_edges:
             return False
-        root_fanout = self._mrrg.get_node(fanout_edges[0].destination.id)
+        root_fanouts: List[MRRGNode] = []
+        for edge in fanout_edges:
+            fanout_node = self._mrrg.get_node(edge.destination.id)
+            if fanout_node is not None:
+                root_fanouts.append(fanout_node)
+        if not root_fanouts:
+            return False
 
         # Build priority queue of sinks (longest paths first)
         sinks: List[SinkAndLatency] = []
@@ -721,15 +1128,30 @@ class PathFinder:
                 # Create empty route for self-loop (no external routing needed)
                 hyperval_net = (hyperval, dest_idx)
                 self._routing_solution[hyperval_net] = []
+                self._route_profiles[hyperval_net] = {
+                    "transport_mode": "flat",
+                    "lane_index": None,
+                    "lane_width": None,
+                    "lane_assignments": {},
+                    "active_pack_nodes": [],
+                    "active_unpack_nodes": [],
+                    "fractured": False,
+                    "chunk_indices": [],
+                    "chunk_widths": [],
+                    "chunk_offsets": [],
+                    "required_bitwidth": None,
+                }
                 if self._debug:
                     print(f"  [SKIP] Self-loop detected for {hyperval.source_id} -> {dest_id} (loop-back edge)")
                 continue
 
             # Get timing constraint using placement-based cycles
             edge_dist = hyperval.dists[dest_idx] if hyperval.dists[dest_idx] is not None else 0
-            cycles_to_sink = self._compute_cycles_source_to_sink(
+            min_cycles_to_sink = self._compute_cycles_source_to_sink(
                 src_dfg_node, dest_dfg_node, edge_dist, src_fu=src_fu, sink_fu=sink_fu
             )
+            II = self._mrrg.II if self._mrrg.II and self._mrrg.II > 0 else 1
+            max_cycles_to_sink = min_cycles_to_sink + (self._timing_slack_iis * II)
 
 
             # Get operand tag
@@ -737,7 +1159,8 @@ class PathFinder:
             operand_tag = self._map_operand_to_tag(operand_str)
 
             sinks.append(SinkAndLatency(
-                cycles_to_sink=cycles_to_sink,
+                cycles_to_sink=min_cycles_to_sink,
+                max_cycles_to_sink=max_cycles_to_sink,
                 dest_idx=dest_idx,
                 dest_dfg_node=dest_dfg_node,
                 sink_fu=sink_fu,
@@ -753,7 +1176,7 @@ class PathFinder:
 
         # Hyperval-aware routing ownership:
         # routes[node] = set(hyperval_ids) of HyperVals that legitimately use this node
-        routes: Dict[MRRGNode, Set[int]] = {}
+        routes: Dict[MRRGNode, Set[str]] = {}
 
         # Store first-pass route for each sink
         sink_routes: Dict[int, List[MRRGNode]] = {}
@@ -763,15 +1186,61 @@ class PathFinder:
 
         # Route each sink in priority order
         for sink_info in sinks:
-            route = self._dijkstra_pathfinder(
-                source=root_fanout,
-                sink=sink_info.sink_fu,
-                tag_to_find=sink_info.operand_tag,
-                hyperval=hyperval,
-                routes=routes,
-                cycles_to_sink=sink_info.cycles_to_sink,
-                latency_of_src=latency_of_src
-            )
+            required_bitwidth = None
+            if (
+                hyperval.bitwidths
+                and sink_info.dest_idx < len(hyperval.bitwidths)
+                and hyperval.bitwidths[sink_info.dest_idx]
+            ):
+                required_bitwidth = int(hyperval.bitwidths[sink_info.dest_idx])
+
+            # Try all immediate source fanouts, keep the shortest successful path.
+            route: List[MRRGNode] = []
+            best_score: Optional[float] = None
+            best_len: Optional[int] = None
+            for root_fanout in root_fanouts:
+                trial_route = self._dijkstra_pathfinder(
+                    source=root_fanout,
+                    sink=sink_info.sink_fu,
+                    tag_to_find=sink_info.operand_tag,
+                    hyperval=hyperval,
+                    required_bitwidth=required_bitwidth,
+                    routes=routes,
+                    min_cycles_to_sink=sink_info.cycles_to_sink,
+                    max_cycles_to_sink=sink_info.max_cycles_to_sink,
+                    latency_of_src=latency_of_src
+                )
+                if trial_route:
+                    trial_profile = self._build_transport_profile(
+                        trial_route,
+                        hyperval,
+                        required_bitwidth,
+                    )
+                    trial_score = self._score_candidate_route(
+                        root_fanout=root_fanout,
+                        route=trial_route,
+                        hyperval=hyperval,
+                        required_bitwidth=required_bitwidth,
+                        speculative_hv_nodes=set(routes.keys()),
+                    )
+                    if (
+                        required_bitwidth is not None
+                        and src_fu.bitwidth > required_bitwidth
+                        and sink_info.sink_fu.bitwidth > required_bitwidth
+                    ):
+                        if trial_profile.get("transport_mode") == "packed":
+                            trial_score -= 0.25
+                        else:
+                            trial_score += 0.25
+                    trial_len = len(trial_route)
+                    if (
+                        best_score is None
+                        or trial_score < best_score
+                        or (trial_score == best_score and (best_len is None or trial_len < best_len))
+                    ):
+                        route = trial_route
+                        best_score = trial_score
+                        best_len = trial_len
 
             if not route:
                 if self._debug:
@@ -780,7 +1249,10 @@ class PathFinder:
                     print(f"    Source:      {src_dfg_node.id} ({src_dfg_node.operation.value}) @ {src_fu.get_full_name()}")
                     print(f"    Destination: {sink_info.dest_dfg_node.id} ({sink_info.dest_dfg_node.operation.value}) @ {sink_info.sink_fu.get_full_name()}")
                     print(f"    HyperVal:    {hyperval.source_id} → {dest_id} [sink {sink_info.dest_idx}]")
-                    print(f"    Timing:      {sink_info.cycles_to_sink} cycles required")
+                    print(
+                        f"    Timing:      {sink_info.cycles_to_sink}"
+                        f"..{sink_info.max_cycles_to_sink} cycles allowed"
+                    )
                     operand_info = f" (operand: {sink_info.operand_tag.value})" if sink_info.operand_tag else ""
                     print(f"    Operand:     {hyperval.operands[sink_info.dest_idx]}{operand_info}")
                 return False
@@ -804,16 +1276,32 @@ class PathFinder:
                 print(f"  ✓ ROUTED: {hyperval.source_id} → {dest_id} [sink {sink_info.dest_idx}]")
                 print(f"    {src_dfg_node.id} ({src_dfg_node.operation.value}) → {sink_info.dest_dfg_node.id} ({sink_info.dest_dfg_node.operation.value})")
                 print(f"    Path: {path_str}")
-                print(f"    Stats: {sink_info.cycles_to_sink} cycles, {len(route)} hops")
+                print(
+                    f"    Stats: {sink_info.cycles_to_sink}"
+                    f"..{sink_info.max_cycles_to_sink} cycles, {len(route)} hops"
+                )
 
         # All sinks routed successfully - commit the saved first-pass routes
         for sink_info in sinks:
             hyperval_net = (hyperval, sink_info.dest_idx)
             route = sink_routes.get(sink_info.dest_idx, [])
+            required_bitwidth = None
+            if (
+                hyperval.bitwidths
+                and sink_info.dest_idx < len(hyperval.bitwidths)
+                and hyperval.bitwidths[sink_info.dest_idx]
+            ):
+                required_bitwidth = int(hyperval.bitwidths[sink_info.dest_idx])
+            profile = self._build_transport_profile(route, hyperval, required_bitwidth)
+            self._route_profiles[hyperval_net] = profile
 
             for node in route:
                 if node.node_type in (NodeType.ROUTING, NodeType.ROUTING_FUNCTION):
-                    self._commit_node(hyperval_net, node)
+                    self._commit_node(
+                        hyperval_net,
+                        node,
+                        lane_index=profile.get("lane_index"),
+                    )
 
         return True
 
@@ -855,10 +1343,10 @@ class PathFinder:
         print("\n" + "="*60)
         print("PATHFINDER ROUTING")
         print("="*60)
-
         print("\n[PHASE 1] Initial routing of all HyperVals...")
+        self._route_profiles = {}
 
-        routed = True
+        routed_all = True
         hypervals: List[HyperValNetInfo] = []
 
         # Route each HyperVal (all destinations together)
@@ -868,8 +1356,7 @@ class PathFinder:
             success = self._route_hyperval(hyperval)
             if not success:
                 # Don't stop the initial routing. Just record failure.
-                routed = False
-                continue
+                routed_all = False
 
             # Compute priority metrics for this HyperVal
             src_hyper_node = self._hyperdfg.get_node(hyperval.source_id)
@@ -895,24 +1382,23 @@ class PathFinder:
 
                     hypervals.append(HyperValNetInfo(
                         hyperval=hyperval,
-                        overuse=False,
+                        overuse=not success,
                         max_cycles=max_cycles,
                         fanout=hyperval.cardinality
                     ))
 
-        if not routed:
+        if not routed_all:
             print("[ERROR] Initial routing failed for some hypervals")
 
-        # Sort hypervals by 
-        hypervals.sort()
+        # Sort by dynamic difficulty (hardest first).
+        hypervals.sort(key=self._compute_hyperval_priority, reverse=True)
 
         # Count total destinations routed
         total_destinations = sum(hyperval_info.hyperval.cardinality for hyperval_info in hypervals)
         print(f"[INFO] Routed {len(hypervals)} HyperVals ({total_destinations} total destinations) in initial pass")
-
         print("\n[PHASE 2] Checking routing legality...")
 
-        mapped = self._compute_dfg_coverage(verbose=True) and self._check_overuse()
+        mapped = self._compute_dfg_coverage(verbose=self._debug) and self._check_overuse()
 
         if mapped:
             print("\n[SUCCESS] Initial routing is legal!")
@@ -927,33 +1413,40 @@ class PathFinder:
             iteration += 1
             print(f"\n--- Iteration {iteration}/{self._max_iterations} ---")
 
-            # Try ripping up and re-routing each HyperVal
-            for hyperval_info in hypervals:
+            any_failed = False
+
+            # Update historical costs and reroute hardest hypervals first.
+            self._update_historical_costs()
+            hypervals.sort(key=self._compute_hyperval_priority, reverse=True)
+            reroute_order = hypervals[:]
+            for hyperval_info in reroute_order:
                 hyperval = hyperval_info.hyperval
 
                 # Rip up ALL destinations of this HyperVal
                 self._rip_up_hyperval(hyperval) 
 
                 # Re-route ALL destinations with updated costs
-                routed = self._route_hyperval(hyperval)
+                rerouted = self._route_hyperval(hyperval)
 
-                if not routed:
-                    if iteration > 1:
+                if not rerouted:
+                    any_failed = True
+                    if iteration > 1 and self._debug:
                         print(f"[ERROR] HyperVal {hyperval.source_id} could not be routed in iter {iteration}")
-                    break
             
             # Check solution after each iteration
-            if routed:
-                mrrg_overuse = self._check_overuse()
-                opgraph_covered = self._compute_dfg_coverage()
-                mapped = mrrg_overuse and opgraph_covered
+            mrrg_overuse = self._check_overuse()
+            opgraph_covered = self._compute_dfg_coverage()
+            mapped = mrrg_overuse and opgraph_covered
 
-                if mapped:
-                    print(f"\n[SUCCESS] Legal routing achieved in iteration {iteration}!")
+            if mapped:
+                print(f"\n[SUCCESS] Legal routing achieved in iteration {iteration}!")
+            elif mrrg_overuse and not opgraph_covered:
+                self._diversify_when_uncovered_but_legal()
+                if self._debug:
+                    print("  [DIVERSIFY] Uncovered-but-legal plateau: nudging historical costs")
 
-            if not routed:
-                print(f"[WARN] Routing failed in iteration {iteration}")
-                break
+            if any_failed and self._debug:
+                print(f"[WARN] Some hypervals failed in iteration {iteration}, continuing negotiation")
 
             if mapped:
                 break
@@ -962,9 +1455,9 @@ class PathFinder:
             self._p_factor = self._p_factor * self._p_growth_rate
             self._h_factor = self._h_factor * self._h_growth_rate
 
-        print("\n" + "="*60)
-        coverage = self._compute_dfg_coverage(verbose=True)
+        coverage = self._compute_dfg_coverage(verbose=self._debug)
         legality = self._check_overuse(verbose=True)
+        print("\n" + "="*60)
         print(f"ROUTING COMPLETE: covered={coverage}, legal={legality}")
         print("="*60)
 

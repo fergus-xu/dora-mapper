@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from mapper.graph.mrrg import MRRGNode, OperandTag
@@ -30,6 +30,10 @@ class RoutingNodePlacementState:
     # Key: HyperVal, Value: count of sinks of that HyperVal using this node
     hyperval_usage: Dict[HyperVal, int] = field(default_factory=dict)
 
+    # Optional packed-lane ownership map.
+    # lane_index -> set of HyperVal source IDs currently using that lane.
+    packed_lane_usage: Dict[int, Set[str]] = field(default_factory=dict)
+
 
 @dataclass
 class SinkAndLatency:
@@ -51,6 +55,9 @@ class SinkAndLatency:
 
     # Sink FU node in MRRG
     sink_fu: 'MRRGNode'
+
+    # Maximum allowed cycles to sink with timing slack
+    max_cycles_to_sink: int
 
     # Required operand tag
     operand_tag: Optional['OperandTag'] = None
@@ -148,6 +155,9 @@ class VertexAndCost:
 
     # The MRRG node
     node: 'MRRGNode' = field(compare=False)
+
+    # Whether the required tag has been satisfied on this path state
+    tag_found: bool = field(default=False, compare=False)
 
     def __hash__(self):
         """Allow use in sets."""

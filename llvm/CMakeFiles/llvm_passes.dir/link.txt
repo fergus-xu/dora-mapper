@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC -shared  -o llvm_passes.so CMakeFiles/llvm_passes.dir/llvm_passes.cpp.o  -Wl,-rpath,/usr/lib/llvm-20/lib /usr/lib/llvm-20/lib/libLLVM.so.1 
