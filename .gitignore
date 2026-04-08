@@ -42,7 +42,9 @@ poetry.lock
 htmlcov/
 .tox/
 .nox/
-*/results/
+
+# Mapper output artifacts
+benchmarks/kernels/**/results/
 
 # ============================================================
 # Type checking / linting
