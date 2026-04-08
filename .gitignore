@@ -42,6 +42,7 @@ poetry.lock
 htmlcov/
 .tox/
 .nox/
+*/results/
 
 # ============================================================
 # Type checking / linting
