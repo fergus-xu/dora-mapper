@@ -16,7 +16,7 @@ KERNEL       ?= sum
 DOT          ?= graph_loop.dot
 # ARCH is the relative path from benchmarks/kernels to the architecture directory
 ARCH         ?= ../architectures/vanilla_hycube/II_1
-MAX_ITERATIONS ?= 1
+MAX_ITERATIONS ?= 4
 MAX_II         ?= 32
 PYTHON         ?= python3
 

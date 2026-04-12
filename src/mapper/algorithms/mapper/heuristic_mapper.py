@@ -240,6 +240,9 @@ class HeuristicMapper:
         total_iterations = 0
             
         while current_ii <= max_ii:
+            if (max_ii % current_ii) != 0:
+                current_ii += 1
+                continue
             print(f"\n{'='*50}")
             print(f"Attempting mapping with II = {current_ii}")
             print(f"{'='*50}")

@@ -286,11 +286,15 @@ def cmd_map(args: argparse.Namespace) -> int:
             and effective_ii < args.max_ii
         ):
             next_ii = effective_ii + 1
+            while (args.max_ii % next_ii) != 0:
+                next_ii += 1
             print(
                 f"FASM conflicts at II={effective_ii}; retrying mapper from II={next_ii}..."
             )
             solved = False
             for target_ii in range(next_ii, args.max_ii + 1):
+                if (args.max_ii % target_ii) != 0:
+                    continue
                 candidate = _run_mapping(start_ii=target_ii, max_ii=target_ii)
                 if candidate["status"] != "success":
                     continue
