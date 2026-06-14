@@ -1,60 +1,41 @@
-#include "markers.h"
 #include <stdint.h>
 
 /*
- * MHA P @ V — mixed-precision MAC inner loop (follows mha_softmax).
+ * MHA P·V MAC kernel — one output element of attention-weighted values.
  *
- * TileLang reference (example_mha_fwd_bshd.py, line 87):
- *   T.gemm(acc_s_cast, V_shared, acc_o, ...)
- *   acc_o[i, d] += P[i, j] * V[j, d]     (fp16 P/V in, fp32 accum)
+ *   out[d] = sum_j P[j] * V[j, d]
  *
- * mp_hycube mixed-precision analogue:
- *   - 8-bit loads for attention weights P (from mha_softmax_row P_row[])
- *   - 8-bit loads for value tile V
- *   - widen 8 -> 32 at PE inputs
- *   - 32-bit MAC into output accumulator acc_o
+ * This extracts the inner j reduction for a fixed head dimension d (PV GEMM row).
  *
- * Dataflow across the three MHA benchmark kernels:
- *   mha_qk_mac   : Q8, K8  --widen--> MAC32 --narrow--> acc_s8
- *   mha_softmax  : acc_s8  --widen--> ALU32 --narrow--> P8
- *   mha_pv_mac   : P8, V8   --widen--> MAC32 ------------> acc_o32
+ * CGRA-ME DFG extraction follows the microbench style (see conv2.c / mha_softmax).
  *
- * Host fixes (i, d) and strides; this body is one iteration over j.
+ * Mixed-precision mapping target (mp_hycube):
+ *   - 8-bit loads of attention weight P and value V
+ *   - 32-bit widen + multiply + accumulate
+ *   - 32-bit output accumulator
  */
 
-#define FRAC_BITS 8
+/* Fake absolute addresses (0xa00=2560, 0xb00=2816, ...) like microbench kernels. */
+static int8_t *P_row = (int8_t *)0xa00;
+static int8_t *V_row = (int8_t *)0xb00;
+static int32_t *out_acc = (int32_t *)0xc00;
+volatile int *block_N = (int *)0xf00;
 
-static int32_t mha_widen_i8(int8_t x)
+/* noinline: loop DFG is extracted from this function. */
+__attribute__((noinline))
+void mha_pv_mac(void)
 {
-    return (int32_t)x;
-}
+    int32_t acc = 0;
+    int n = *block_N;
 
-void mha_pv_mac(
-    int block_N,
-    int i,
-    int d,
-    int p_row_stride,
-    int v_row_stride,
-    const int8_t *P,
-    const int8_t *V,
-    int32_t *acc_o_inout)
-{
-    int32_t acc = *acc_o_inout;
+    for (int j = 0; j < n; j++) {
+        //DFGLoop: loop
 
-    for (int j = 0; j < block_N; j++) {
-        KERNEL_START();
-
-        /* P: 8-bit softmax output; V: 8-bit value cache tile */
-        int8_t p8 = P[i * p_row_stride + j];
-        int8_t v8 = V[j * v_row_stride + d];
-
-        int32_t p32 = mha_widen_i8(p8);
-        int32_t v32 = mha_widen_i8(v8);
-
-        acc = acc + (p32 * v32);
-
-        KERNEL_END();
+        int8_t p8 = P_row[j];
+        int8_t v8 = V_row[j];
+        int32_t prod = ((int32_t)p8) * ((int32_t)v8);
+        acc = acc + prod;
     }
 
-    *acc_o_inout = acc;
+    *out_acc = acc;
 }
