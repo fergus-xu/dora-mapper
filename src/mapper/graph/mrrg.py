@@ -2,11 +2,73 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Any, Set, Tuple
+from typing import Dict, List, Optional, Any, Set, Tuple, Callable
 from enum import Enum
+import re
 from mapper.graph.graph_base import Graph, Node, Edge
 from mapper.graph.dfg import OperationType
 import mapper.graph.utils.traversal as traversal
+
+
+def _port_bitwidths_from_operations(json_ops: List[Dict[str, Any]]) -> List[int]:
+    """Collect declared data port bitwidths from Dora operation bindings."""
+    widths: List[int] = []
+    for op_entry in json_ops:
+        for port_map in op_entry.get("input_port_map", []) + op_entry.get("output_port_map", []):
+            bw = port_map.get("bitwidth")
+            if isinstance(bw, int) and bw > 0:
+                widths.append(bw)
+    return widths
+
+
+def _operation_bitwidth_limits(
+    json_ops: List[Dict[str, Any]],
+    map_op: Callable[[str, str], Optional[OperationType]],
+) -> Dict[OperationType, int]:
+    """Max supported bitwidth per operation type from port maps."""
+    limits: Dict[OperationType, int] = {}
+    for op_entry in json_ops:
+        mapped_op = map_op(op_entry.get("optype", ""), op_entry.get("operation_id", ""))
+        if mapped_op is None:
+            continue
+        port_widths = _port_bitwidths_from_operations([op_entry])
+        if port_widths:
+            limits[mapped_op] = max(limits.get(mapped_op, 0), max(port_widths))
+    return limits
+
+
+def _infer_instance_bitwidth(
+    node_data: Dict[str, Any],
+    model: Optional[str],
+    json_ops: List[Dict[str, Any]],
+    datatype: Optional[str],
+) -> int:
+    """
+    Infer native datapath width for an MRRG instance node.
+
+    IO pads and mixed-precision modules encode width in the model name
+    (e.g. iopad_8b) and/or in per-operation port maps. Without this,
+    instance nodes default to 32 bits even when attached nets are 8-bit.
+    """
+    explicit = node_data.get("bitwidth")
+    if explicit is not None:
+        return int(explicit)
+
+    model_l = (model or "").lower()
+    model_match = re.search(r"_(\d+)b(?:_|$|\.)", model_l)
+    if model_match:
+        return int(model_match.group(1))
+
+    port_widths = _port_bitwidths_from_operations(json_ops)
+    if port_widths:
+        return max(port_widths)
+
+    if datatype and "int" in datatype:
+        dtype_match = re.search(r"int(\d+)", datatype)
+        if dtype_match:
+            return int(dtype_match.group(1))
+
+    return 32
 
 
 class NodeType(Enum):
@@ -84,6 +146,7 @@ class MRRGNode(Node):
         fracture_chunk_index: Optional[int] = None,
         fracture_bit_offset: Optional[int] = None,
         fracture_num_chunks: Optional[int] = None,
+        operation_bitwidths: Optional[Dict[OperationType, int]] = None,
         **attributes: Any
     ) -> None:
         """
@@ -146,6 +209,13 @@ class MRRGNode(Node):
         self.fracture_chunk_index = fracture_chunk_index
         self.fracture_bit_offset = fracture_bit_offset
         self.fracture_num_chunks = fracture_num_chunks
+        self.operation_bitwidths: Dict[OperationType, int] = operation_bitwidths or {}
+
+    def max_bitwidth_for_operation(self, operation: OperationType) -> int:
+        """Native datapath width supported for a specific operation on this node."""
+        if operation in self.operation_bitwidths:
+            return self.operation_bitwidths[operation]
+        return self.bitwidth
 
     def can_execute(self, operation: OperationType, required_bitwidth: Optional[int] = None) -> bool:
         """
@@ -164,8 +234,9 @@ class MRRGNode(Node):
             return False
         
         # Check bitwidth compatibility if specified
-        if required_bitwidth is not None and self.bitwidth < required_bitwidth:
-            return False
+        if required_bitwidth is not None:
+            if self.max_bitwidth_for_operation(operation) < required_bitwidth:
+                return False
         
         return True
 
@@ -980,7 +1051,9 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                         hw_entity_type=node.hw_entity_type,
                         latency=node.latency,
                         bitwidth=node.bitwidth,
-                        supported_operations=node.supported_operations.copy()
+                        supported_operations=node.supported_operations.copy(),
+                        operation_bitwidths=node.operation_bitwidths.copy(),
+                        model=getattr(node, "model", None),
                     )
                     # Copy extra attributes if they exist
                     for attr in ['routing_type', 'bank_id', 'read_ports', 'write_ports']:
@@ -1484,17 +1557,10 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
             node_type, hw_entity_type, coordinates = classify_node(node_data)
             
             # Bitwidth detection
-            bitwidth = node_data.get("bitwidth")
-            if bitwidth is None:
-                # Fallback to datatype parsing
-                if datatype and "int" in datatype:
-                    match = re.search(r'int(\d+)', datatype)
-                    bitwidth = int(match.group(1)) if match else 32
-                else:
-                    bitwidth = 32
+            json_ops = node_data.get("operations", [])
+            bitwidth = _infer_instance_bitwidth(node_data, model, json_ops, datatype)
             
             # Check explicit "operations" field first (new Dora feature)
-            json_ops = node_data.get("operations", [])
 
             # Latency detection:
             # 1) explicit top-level node latency
@@ -1527,6 +1593,8 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                 mapped_op = map_dora_operation(op_str, operation_id)
                 if mapped_op is not None:
                     supported_operations.add(mapped_op)
+
+            operation_bitwidths = _operation_bitwidth_limits(json_ops, map_dora_operation)
             
             # If no explicit ops, fall back to module_operations_map from compiler_arch
             if not supported_operations and model:
@@ -1582,6 +1650,7 @@ class MRRG(Graph[MRRGNode, MRRGEdge]):
                 latency=latency,
                 bitwidth=bitwidth,
                 supported_operations=supported_operations,
+                operation_bitwidths=operation_bitwidths,
                 model=model,
                 datatype=datatype,
                 dora_kind=node_data.get("kind"),

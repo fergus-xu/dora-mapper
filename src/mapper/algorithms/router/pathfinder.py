@@ -951,7 +951,8 @@ class PathFinder:
             if sink == explore_curr:
                 # Check timing constraint
                 if min_cycles_to_sink <= cycles_to_curr <= max_cycles_to_sink:
-                    found_state = state_key
+                    if required_bitwidth is None or sink.bitwidth >= required_bitwidth:
+                        found_state = state_key
                 continue
 
             for fanout_edge in self._mrrg.get_outgoing_edges(explore_curr.id):
@@ -1144,6 +1145,24 @@ class PathFinder:
                 if self._debug:
                     print(f"  [SKIP] Self-loop detected for {hyperval.source_id} -> {dest_id} (loop-back edge)")
                 continue
+
+            required_sink_bitwidth = None
+            if (
+                hyperval.bitwidths
+                and dest_idx < len(hyperval.bitwidths)
+                and hyperval.bitwidths[dest_idx]
+            ):
+                required_sink_bitwidth = int(hyperval.bitwidths[dest_idx])
+
+            if required_sink_bitwidth is not None:
+                sink_limit = sink_fu.max_bitwidth_for_operation(dest_dfg_node.operation)
+                if sink_limit < required_sink_bitwidth:
+                    if self._debug:
+                        print(
+                            f"  [REJECT] Sink {dest_id} @ {sink_fu.get_full_name()} "
+                            f"supports {sink_limit}b but edge requires {required_sink_bitwidth}b"
+                        )
+                    return False
 
             # Get timing constraint using placement-based cycles
             edge_dist = hyperval.dists[dest_idx] if hyperval.dists[dest_idx] is not None else 0
