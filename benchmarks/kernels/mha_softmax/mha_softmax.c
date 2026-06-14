@@ -8,12 +8,17 @@
  *   acc_s[i, j] = exp2(acc_s[i, j] * scale - scores_max[i] * scale)
  *   scores_sum[i] += acc_s[i, j]   (via reduce_sum over j)
  *
- * This C kernel extracts one iteration of the inner j loop for CGRA DFG
- * generation. Mixed-precision mapping target (mp_hycube):
- *   - 8-bit load of QK scores
- *   - 32-bit ALU for subtract / accumulate
+ * Pipeline position (mixed-precision MHA benchmarks):
+ *   mha_qk_mac  ->  mha_softmax  ->  mha_pv_mac
+ *        Q8,K8           acc_s8            P8,V8
+ *          |                |                 |
+ *        MAC32           ALU32             MAC32
+ *
+ * mp_hycube mapping target:
+ *   - 8-bit load of QK scores (acc_s_row from mha_qk_mac narrow store)
+ *   - 32-bit ALU for subtract / accumulate / LUT index
  *   - LUT load for exp approximation (no fp32 exp2 on HyCUBE)
- *   - 8-bit store of attention weights P
+ *   - 8-bit store of attention weights P (input to mha_pv_mac)
  *
  * Fixed-point: values use FRAC_BITS fractional bits in int32 paths.
  * scores_max is provided in the same fixed-point format as widened scores.
