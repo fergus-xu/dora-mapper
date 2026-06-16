@@ -227,22 +227,18 @@ class HeuristicMapper:
         if self._debug:
             print(f"\nTheoretical minimum II: {min_ii}")
             
-        # Time expand MRRG if starting II > 1.
-        # Always expand from the original base MRRG to avoid compounding
-        # expansion artifacts across II attempts.
-        if current_ii > self._base_mrrg.II:
-            if self._debug:
-                print(f"Time-expanding MRRG to starting II={current_ii}...")
-            self._mrrg = self._base_mrrg.time_expand(current_ii)
-        else:
-            self._mrrg = self._base_mrrg
-
+        self._mrrg = self._base_mrrg
         total_iterations = 0
             
         while current_ii <= max_ii:
             if (max_ii % current_ii) != 0:
                 current_ii += 1
                 continue
+            if self._mrrg.II != current_ii:
+                if self._debug:
+                    print(f"Time-expanding MRRG to II={current_ii}...")
+                self._mrrg = self._base_mrrg.time_expand(current_ii)
+                self._timed_out = False
             print(f"\n{'='*50}")
             print(f"Attempting mapping with II = {current_ii}")
             print(f"{'='*50}")
@@ -266,13 +262,7 @@ class HeuristicMapper:
             except Exception as e:
                 print(f"[ERROR] Exception during mapping at II={current_ii}: {str(e)}")
                 
-            # Escalate II
             current_ii += 1
-            if current_ii <= max_ii:
-                if self._debug:
-                    print(f"\nTime-expanding MRRG from II={current_ii-1} to II={current_ii}...")
-                self._mrrg = self._base_mrrg.time_expand(current_ii)
-                self._timed_out = False
                 
         # Failed to map even at max_ii
         return {
